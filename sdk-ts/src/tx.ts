@@ -1,0 +1,74 @@
+// Canonical transaction encoding. Must stay byte-identical to node/src/types.rs `Tx::signing_bytes`.
+
+export type Action =
+  | { type: "transfer"; to: string; amount: string }
+  | { type: "register_name"; name: string };
+
+export interface UnsignedTx {
+  chain_id: string;
+  nonce: number;
+  fee: string;
+  action: Action;
+  memo: string;
+}
+
+export interface Tx extends UnsignedTx {
+  public_key: string;
+  signature: string;
+}
+
+export const PUBLIC_KEY_LEN = 1952;
+export const SIGNATURE_LEN = 3309;
+export const DROPS_PER_FANG = 1_000_000_000n;
+
+const utf8 = new TextEncoder();
+
+class Writer {
+  private parts: number[] = [];
+  bytes(b: Uint8Array) { for (const x of b) this.parts.push(x); }
+  u8(n: number) { this.parts.push(n & 0xff); }
+  u16(n: number) { this.u8(n); this.u8(n >> 8); }
+  u64(n: bigint) { for (let i = 0n; i < 8n; i++) this.u8(Number((n >> (8n * i)) & 0xffn)); }
+  str(s: string) { const b = utf8.encode(s); this.u16(b.length); this.bytes(b); }
+  done() { return Uint8Array.from(this.parts); }
+}
+
+export function signingBytes(tx: UnsignedTx): Uint8Array {
+  const w = new Writer();
+  w.bytes(utf8.encode("BLOCKULA_TX_V1"));
+  w.str(tx.chain_id);
+  w.u64(BigInt(tx.nonce));
+  w.u64(BigInt(tx.fee));
+  if (tx.action.type === "transfer") {
+    w.u8(0);
+    w.str(tx.action.to);
+    w.u64(BigInt(tx.action.amount));
+  } else {
+    w.u8(1);
+    w.str(tx.action.name);
+  }
+  w.str(tx.memo);
+  return w.done();
+}
+
+/** Mirrors `min_fee` in node/src/types.rs: base fee is priced per byte and burned. */
+export function minFee(tx: UnsignedTx): bigint {
+  const size = signingBytes(tx).length + PUBLIC_KEY_LEN + SIGNATURE_LEN;
+  return 10_000n + BigInt(size) * 10n;
+}
+
+/** "1.5" → 1500000000n drops. Accepts numbers, decimal strings or bigint drops. */
+export function parseFang(amount: string | number | bigint): bigint {
+  if (typeof amount === "bigint") return amount;
+  const s = String(amount).trim();
+  if (!/^\d+(\.\d{1,9})?$/.test(s)) throw new Error(`invalid FANG amount: ${s}`);
+  const [whole, frac = ""] = s.split(".");
+  return BigInt(whole) * DROPS_PER_FANG + BigInt(frac.padEnd(9, "0"));
+}
+
+export function formatFang(drops: bigint | string): string {
+  const d = BigInt(drops);
+  const whole = d / DROPS_PER_FANG;
+  const frac = (d % DROPS_PER_FANG).toString().padStart(9, "0").replace(/0+$/, "");
+  return `${whole}${frac ? "." + frac : ""} FANG`;
+}

@@ -1,0 +1,10 @@
+{
+  "name": "blockula",
+  "private": true,
+  "workspaces": ["sdk-ts", "mcp"],
+  "scripts": {
+    "build": "cargo build --release --manifest-path node/Cargo.toml && npm run build -w @blockula/sdk && npm run build -w @blockula/mcp",
+    "dev": "cargo run --release --manifest-path node/Cargo.toml -- dev",
+    "test": "cargo test --manifest-path node/Cargo.toml && npm test -w @blockula/sdk"
+  }
+}

@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>🧛 Blockula Explorer</title>
+<style>
+  :root { --bg:#0e0a14; --panel:#181121; --line:#2c2038; --text:#ece6f3; --dim:#9a8fab; --pumpkin:#ff8a2a; --blood:#e2385a; --slime:#8be36b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  a { color:var(--pumpkin); text-decoration:none; } a:hover { text-decoration:underline; }
+  header { display:flex; gap:16px; align-items:center; padding:14px 24px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { margin:0; font-size:20px; } header h1 a { color:var(--text); }
+  header form { flex:1; min-width:240px; }
+  input { width:100%; padding:10px 14px; border-radius:10px; border:1px solid var(--line); background:var(--panel); color:var(--text); font-size:15px; }
+  nav a { margin-left:14px; color:var(--dim); }
+  main { max-width:1100px; margin:0 auto; padding:24px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(170px,1fr)); gap:12px; margin-bottom:24px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px; }
+  .stat .v { font-size:22px; font-weight:600; } .stat .k { color:var(--dim); font-size:13px; }
+  .row { display:flex; justify-content:space-between; gap:12px; padding:10px 0; border-bottom:1px solid var(--line); align-items:center; }
+  .row:last-child { border-bottom:0; }
+  .dim { color:var(--dim); font-size:13px; }
+  .mono { font-family:ui-monospace, Menlo, monospace; font-size:13px; word-break:break-all; }
+  .summary { font-size:17px; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:99px; font-size:12px; background:#2a1d36; color:var(--slime); }
+  .pill.pending { color:var(--pumpkin); }
+  dl { display:grid; grid-template-columns:200px 1fr; gap:10px 16px; margin:0; } dt { color:var(--dim); }
+  .term { border-bottom:1px dotted var(--dim); cursor:help; position:relative; }
+  .term:hover::after { content:attr(data-tip); position:absolute; left:0; top:100%; margin-top:6px; width:300px; padding:10px 12px; border-radius:10px; background:#241830; border:1px solid var(--line); color:var(--text); font-size:13px; z-index:5; white-space:normal; }
+  .learn { border-color:var(--pumpkin); }
+  .learn ol { margin:8px 0 0; padding-left:20px; } .learn li { margin:6px 0; }
+  h2 { font-size:16px; margin:0 0 8px; } .err { color:var(--blood); }
+  details summary { cursor:pointer; color:var(--dim); margin-top:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="#/">🧛 Blockula</a></h1>
+  <form id="search"><input id="q" placeholder="Search a name (jack.boo), address, block # or tx…" autocomplete="off" /></form>
+  <nav><a href="#/learn">📖 Learn</a><a href="#/">⛓️ Blocks</a></nav>
+</header>
+<main id="app">Rising from the grave…</main>
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+const api = async (p) => { const r = await fetch("/api" + p); const j = await r.json(); if (!r.ok) throw new Error(j.error); return j; };
+const ago = (ms) => { const s = Math.max(0, Math.round((Date.now() - ms) / 1000)); return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.round(s/60)}m ago` : `${Math.round(s/3600)}h ago`; };
+
+const GLOSSARY = {
+  block: "A batch of transactions sealed together. Each block points to the one before it, forming a chain that can't be quietly rewritten.",
+  height: "The block's position in the chain. Block #1 is the first block after genesis.",
+  hash: "A 256-bit BLAKE3 fingerprint. Change one byte of the data and the fingerprint changes completely. Quantum computers only weaken hashes a little, so 256 bits stays safe.",
+  signature: "Proof that the owner of a key approved this. Blockula uses ML-DSA-65 (NIST FIPS 204), a lattice-based scheme designed to resist quantum computers — unlike the ECDSA used by Bitcoin and Ethereum.",
+  nonce: "A counter for each account. It stops anyone from replaying the same signed transaction twice.",
+  fee: "What it costs to include a transaction. The base part is burned 🔥 forever, slowly reducing supply. It's priced by size because post-quantum signatures are bigger.",
+  state_root: "A single hash summarizing every balance and name after this block. If two nodes agree on it, they agree on everything.",
+  address: "Your account ID: bech32m('boo', BLAKE3(public key)). You rarely need to see it — names like jack.boo point to it.",
+  name: "A human-readable .boo name that points to an address, like a domain name for your wallet.",
+  finalized: "Included in a block. On Blockula, once a block is sealed it's final — no waiting for confirmations.",
+  proposer: "The validator that assembled and signed this block.",
+  burned: "Fees destroyed forever. Burning offsets new issuance and ties the token's value to real network usage.",
+};
+const term = (key, text) => `<span class="term" data-tip="${esc(GLOSSARY[key])}">${esc(text ?? key)}</span>`;
+const who = (l) => l ? `<a href="#/account/${esc(l.name && !l.name.includes(" ") ? l.name : l.address)}">${esc(l.name || l.short)}</a>` : "—";
+
+const views = {
+  async home() {
+    const [s, blocks] = await Promise.all([api("/status"), api("/blocks?limit=15")]);
+    return `
+      <div class="grid">
+        <div class="card stat"><div class="v">#${s.height}</div><div class="k">${term("height", "latest block")}</div></div>
+        <div class="card stat"><div class="v">${esc(s.supply_display)}</div><div class="k">total supply</div></div>
+        <div class="card stat"><div class="v">${esc(s.burned_display)}</div><div class="k">${term("burned", "🔥 burned")}</div></div>
+        <div class="card stat"><div class="v">${s.accounts}</div><div class="k">accounts</div></div>
+        <div class="card stat"><div class="v">${s.names}</div><div class="k">${term("name", ".boo names")}</div></div>
+      </div>
+      <div class="card learn" style="margin-bottom:24px">
+        <h2>👻 New here?</h2>
+        This is <b>${esc(s.chain_id)}</b>, a blockchain secured by <b>${term("signature", "post-quantum signatures")}</b>.
+        Every second a new ${term("block")} is sealed. Click anything to dig in, or <a href="#/learn">take the 2-minute tour →</a>
+      </div>
+      <div class="card"><h2>Latest blocks</h2>
+        ${blocks.map((b) => `<div class="row"><div><a href="#/block/${b.height}">#${b.height}</a> <span class="dim">${esc(b.summary)}</span></div><div class="dim">${ago(b.timestamp_ms)}</div></div>`).join("")}
+      </div>`;
+  },
+  async block(id) {
+    const b = await api("/block/" + id);
+    return `
+      <div class="card"><div class="summary">${esc(b.summary)}</div><div class="dim">${new Date(b.timestamp_ms).toLocaleString()} · ${ago(b.timestamp_ms)}</div></div><br>
+      <div class="card"><dl>
+        <dt>${term("height")}</dt><dd>#${b.height} · <a href="#/block/${b.height - 1}">← prev</a> · <a href="#/block/${b.height + 1}">next →</a></dd>
+        <dt>${term("proposer")}</dt><dd>${who(b.proposer)}</dd>
+        <dt>${term("hash", "block hash")}</dt><dd class="mono">${esc(b.hash)}</dd>
+        <dt>${term("hash", "previous hash")}</dt><dd class="mono">${esc(b.prev_hash)}</dd>
+        <dt>${term("state_root")}</dt><dd class="mono">${esc(b.state_root)}</dd>
+        <dt>${term("signature")}</dt><dd>ML-DSA-65 · ${b.signature_bytes.toLocaleString()} bytes</dd>
+      </dl></div><br>
+      <div class="card"><h2>Transactions (${b.tx_count})</h2>${b.txs.length ? b.txs.map(txRow).join("") : '<div class="dim">A quiet block. Nothing stirred. 🕸️</div>'}</div>`;
+  },
+  async tx(id) {
+    const t = await api("/tx/" + id);
+    return `
+      <div class="card"><div class="summary">${esc(t.summary)}</div>
+        <span class="pill ${t.status}">${term("finalized", t.status)}</span> ${t.height ? `in <a href="#/block/${t.height}">block #${t.height}</a>` : ""}
+        ${t.memo ? `<p>💬 “${esc(t.memo)}”</p>` : ""}</div><br>
+      <div class="card"><dl>
+        <dt>From</dt><dd>${who(t.from)}</dd>
+        ${t.to ? `<dt>To</dt><dd>${who(t.to)}</dd>` : ""}
+        ${t.amount_display ? `<dt>Amount</dt><dd>${esc(t.amount_display)}</dd>` : ""}
+        <dt>${term("fee")}</dt><dd>${esc(t.fee_display)}</dd>
+        <dt>${term("nonce")}</dt><dd>${t.nonce}</dd>
+        <dt>${term("signature")}</dt><dd>${esc(t.signature_scheme)} · ${t.size_bytes.toLocaleString()} byte transaction</dd>
+        <dt>${term("hash", "transaction id")}</dt><dd class="mono">${esc(t.id)}</dd>
+      </dl>
+      <details><summary>Raw data (for the brave)</summary><pre class="mono">${esc(JSON.stringify(t.action, null, 2))}</pre></details></div>`;
+  },
+  async account(id) {
+    const a = await api("/account/" + encodeURIComponent(id));
+    return `
+      <div class="card"><div class="summary">${esc(a.account.name || "Unnamed account")}</div>
+        <div class="dim">${term("address")}: <span class="mono">${esc(a.account.address)}</span></div></div><br>
+      <div class="grid">
+        <div class="card stat"><div class="v">${esc(a.balance_display)}</div><div class="k">balance</div></div>
+        <div class="card stat"><div class="v">${a.nonce}</div><div class="k">${term("nonce", "transactions sent")}</div></div>
+        <div class="card stat"><div class="v">${a.names.length}</div><div class="k">${term("name", "names owned")}</div></div>
+      </div>
+      ${a.names.length ? `<div class="card"><h2>Names</h2>${a.names.map((n) => `<span class="pill">${esc(n)}</span> `).join("")}</div><br>` : ""}
+      <div class="card"><h2>Recent activity</h2>${a.recent_txs.length ? a.recent_txs.map(txRow).join("") : '<div class="dim">No activity yet. Spooky quiet.</div>'}</div>`;
+  },
+  async name(n) {
+    const r = await api("/name/" + n);
+    return `<div class="card"><div class="summary">🪦 ${esc(r.name)} is unclaimed</div><p>Anyone can register it for <b>${esc(r.price_display)}</b>. Shorter names cost more because they're scarcer. The fee goes to the community treasury.</p>
+      <p class="dim">Register it with the SDK: <span class="mono">await wallet.registerName("${esc(r.name)}")</span></p></div>`;
+  },
+  async learn() {
+    const s = await api("/status");
+    return `<div class="card learn"><h2>📖 Blockula in 2 minutes</h2><ol>
+      <li><b>A blockchain is a shared notebook.</b> Thousands of computers keep identical copies, and new pages (${term("block", "blocks")}) are added every second. Each page includes a ${term("hash")} of the one before, so nobody can quietly rip one out.</li>
+      <li><b>Your wallet is a key, not an account at a company.</b> Only your key can produce the ${term("signature")} that moves your FANG. Blockula's keys are unlocked by a <b>passkey</b> (Face ID / Touch ID), so there's no seed phrase to lose.</li>
+      <li><b>Why "post-quantum"?</b> Future quantum computers could forge the signatures that Bitcoin and Ethereum use today. Blockula uses ML-DSA, a NIST-standardized scheme built on lattice math that quantum computers aren't known to break. The tradeoff: signatures are about 3 KB instead of 64 bytes.</li>
+      <li><b>Names instead of gibberish.</b> Instead of <span class="mono">boo1qx…</span>, you send to <b>alice.boo</b>.</li>
+      <li><b>Fees are burned.</b> Every transaction pays a small ${term("fee")}, and the base part is destroyed. So far ${esc(s.burned_display)} has been ${term("burned")}.</li>
+      <li><b>Coming soon: 👻 Ghost Mode.</b> Private transfers using zero-knowledge proofs (hash-based STARKs, also quantum-safe). The explorer will show <i>that</i> something happened, but not who or how much.</li>
+    </ol><p>Try it: search for a name above, or open the <a href="#/">latest blocks</a> and click around. Every dotted word has an explanation if you hover.</p></div>`;
+  },
+};
+
+function txRow(t) {
+  return `<div class="row"><div><a href="#/tx/${t.id}">${esc(t.summary)}</a>${t.memo ? ` <span class="dim">“${esc(t.memo)}”</span>` : ""}</div><span class="pill ${t.status}">${t.status}</span></div>`;
+}
+
+async function route() {
+  const [, view = "", id = ""] = location.hash.split("/");
+  const fn = views[view] || views.home;
+  try { $("#app").innerHTML = await fn(decodeURIComponent(id)); }
+  catch (e) { $("#app").innerHTML = `<div class="card err">🦴 ${esc(e.message)}</div>`; }
+}
+
+$("#search").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try { const h = await api("/search/" + encodeURIComponent($("#q").value)); location.hash = `#/${h.type}/${h.id}`; }
+  catch (err) { $("#app").innerHTML = `<div class="card err">🦴 ${esc(err.message)}</div>`; }
+});
+window.addEventListener("hashchange", route);
+route();
+setInterval(() => { if (!location.hash || location.hash === "#/") route(); }, 3000);
+</script>
+</body>
+</html>

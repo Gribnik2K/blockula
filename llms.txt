@@ -1,0 +1,12 @@
+# Blockula
+
+> Post-quantum blockchain (ML-DSA-65 signatures, BLAKE3) with passkey wallets, .boo names, and an MCP server for agents. Token: FANG (9 decimals).
+
+- [Agent guide](AGENTS.md): copy-paste prompt, rules, HTTP API
+- [README](README.md): quickstart, SDK examples, run your own chain
+- [Plan](docs/PLAN.md): architecture, privacy (Ghost Mode), tokenomics, roadmap
+
+## Fastest path
+1. `claude mcp add blockula -- npx -y @blockula/mcp`
+2. MCP: start_dev_node → create_wallet → faucet → send / register_name
+3. App code: `import { Wallet, Client } from "@blockula/sdk"`; browser users: `import { createPasskeyWallet } from "@blockula/sdk/passkey"`
