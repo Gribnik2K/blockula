@@ -8,7 +8,7 @@ claude mcp add blockula -- npx -y @blockula/mcp
 
 It works with zero setup: if no local node is running, it connects to the public testnet at `https://blockula-testnet.fly.dev`. Call `status` to see which node you're on.
 
-**Tools:** `status`, `tx_status`, `start_dev_node`, `summon_chain`, `create_wallet`, `use_account`, `wallet_info`, `faucet`, `send`, `check_name`, `register_name`, `lookup`, `latest_blocks`.
+**Tools:** `status`, `tx_status`, `install_node`, `list_hunts`, `link_github`, `fund_hunt`, `start_dev_node`, `summon_chain`, `create_wallet`, `use_account`, `wallet_info`, `faucet`, `send`, `check_name`, `register_name`, `lookup`, `latest_blocks`.
 
 **Spending a user's money safely:**
 1. `create_wallet` gives you a `key_id`. Hand it to the user.

@@ -259,4 +259,26 @@ tool("latest_blocks", "The most recent blocks, summarized.", { limit: z.number()
   return blocks.map((b: { summary: string; hash: string }) => `${b.summary} · ${b.hash.slice(0, 12)}…`);
 });
 
+tool("list_hunts", "Open bounties (Hunts) on GitHub issues, with FANG escrowed on-chain. Each links to an issue with acceptance criteria: implement it, open a PR, and the bounty is awarded on-chain when it merges.", { status: z.enum(["open", "awarded", "cancelled", "expired"]).default("open") }, async ({ status }) => {
+  const res = await client.hunts(status);
+  const hunts = (Array.isArray(res) ? res : res.hunts ?? []) as { id: number; title: string; amount_display: string; issue_url: string; expires_at: number; funders?: unknown[] }[];
+  return hunts.map((h) => ({ hunt_id: h.id, bounty: h.amount_display, title: h.title, issue: h.issue_url, funders: h.funders?.length ?? 0, explorer: `${RPC}/#/hunt/${h.id}` }));
+});
+
+tool("link_github", "Link a GitHub handle to the account this agent acts for, so Hunt awards show up on its profile. First create a PUBLIC gist (as that GitHub user) containing the account's boo1 address, then pass the gist id here.", { handle: z.string().regex(/^[A-Za-z0-9-]{1,39}$/), gist_id: z.string().regex(/^[0-9a-f]{20,40}$/) }, async ({ handle, gist_id }) => {
+  const tx = await requireWallet().linkGithub(handle, gist_id);
+  const check = await client.github(handle).catch(() => null);
+  return { summary: tx.summary, verified: check?.verified ?? false, explorer: `${RPC}/#/tx/${tx.id}` };
+});
+
+tool("fund_hunt", "Add FANG to an open Hunt's bounty (crowdfunding). Refunded to you if the hunt is cancelled.", { hunt_id: z.number().int().min(0), amount: z.string() }, async ({ hunt_id, amount }) => {
+  const drops = parseFang(amount);
+  if (drops > MAX_SEND) throw new Error(`amount exceeds this agent's per-send limit (BLOCKULA_MAX_SEND=${process.env.BLOCKULA_MAX_SEND ?? "100"} FANG)`);
+  const today = spentToday();
+  if (today.spent + drops > MAX_DAILY) throw new Error(`this would exceed the agent's daily limit (BLOCKULA_MAX_DAILY=${process.env.BLOCKULA_MAX_DAILY ?? "100"} FANG)`);
+  const tx = await requireWallet().fundHunt(hunt_id, amount);
+  writeFileSync(SPEND_FILE, JSON.stringify({ day: today.day, spent: (today.spent + drops + BigInt(tx.fee)).toString() }), { mode: 0o600 });
+  return { summary: tx.summary, explorer: `${RPC}/#/hunt/${hunt_id}` };
+});
+
 await server.connect(new StdioServerTransport());

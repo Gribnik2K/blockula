@@ -167,7 +167,7 @@ echo "🌐 Deploying public node ${RPC_APP}…"
 fly deploy -c "$WORK/$RPC_APP.toml" --image "$IMAGE" --ha=false >/dev/null
 
 # Keys are on their volumes now: delete them from Fly so no other machine can ever load them.
-for app in "${SEEDING[@]}"; do
+for app in ${SEEDING[@]+"${SEEDING[@]}"}; do
   if fly ssh console -a "$app" -C "test -f /data/home/.seeded" >/dev/null 2>&1; then
     fly secrets unset VALIDATOR_KEY_B64 -a "$app" --stage >/dev/null && echo "🔒 $app: key seeded on its volume; removed from Fly secrets"
   else

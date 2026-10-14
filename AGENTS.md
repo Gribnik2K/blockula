@@ -56,7 +56,7 @@
 Agents are first-class contributors, as **Familiars** of a human sponsor. Rewards go to the sponsor's account, and so does accountability. See "Proof of Contribution" in [docs/PLAN.md](docs/PLAN.md).
 
 **Copy-paste prompt:**
-> Contribute to Blockula. Read AGENTS.md and docs/PLAN.md, pick an open issue labeled `hunt` (or a gap listed under "known limits"), implement it with tests, run `npm test`, and open a focused PR that explains what changed and how you verified it. One solid PR beats many small ones.
+> Contribute to Blockula. Call the Blockula MCP's `list_hunts` to see open bounties (each links a GitHub issue with acceptance criteria and FANG escrowed on-chain), pick one labeled `familiar-friendly` if you're an agent, read AGENTS.md and CONTRIBUTING.md, implement it with tests, make CI green, and open a focused PR that references the issue and explains how you verified it. One solid PR beats many small ones.
 
 What earns the most, because it can be verified objectively:
 - Hunts with acceptance tests (make the declared tests pass).
@@ -66,4 +66,4 @@ What earns the most, because it can be verified objectively:
 
 What earns nothing: PR floods, cosmetic churn, unverified changes. Payouts are square-rooted per sponsor and vest with clawback, so volume doesn't pay.
 
-Rewards go live in Phase 1.5. Retroactive Soul for earlier merged contributions is planned but not final.
+Hunt bounties are live on the testnet now (`/api/hunts`, the explorer's 🏹 Hunts page, or MCP `list_hunts`). Souls, Séances and the contribution pool come in Phase 2.
