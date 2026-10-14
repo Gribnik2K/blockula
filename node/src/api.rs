@@ -210,7 +210,7 @@ impl Node {
                     let code = if status.is_client_error() || status == StatusCode::SERVICE_UNAVAILABLE { status } else { StatusCode::BAD_GATEWAY };
                     return Err(ApiError(code, v["error"].as_str().unwrap_or("peer rejected the request").to_string()));
                 }
-                Err(e) => last = e.to_string(),
+                Err(e) => last = format!("{:#}", anyhow::Error::from(e)),
             }
         }
         Err(ApiError(StatusCode::BAD_GATEWAY, format!("couldn't reach a validator: {last}")))
@@ -840,6 +840,17 @@ mod http_tests {
         let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
         let text = String::from_utf8_lossy(&bytes).to_string();
         (status, serde_json::from_str(&text).unwrap_or(Value::Null), text)
+    }
+
+    #[tokio::test]
+    async fn forwarding_supports_https_peers() {
+        let (root, mut n) = node("tlsfwd");
+        n.peers = vec!["https://127.0.0.1:9".into()];
+        let err = n.forward("/faucet", &json!({ "to": "x" }), None).await.err().unwrap();
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert!(!err.1.contains("scheme"), "{}", err.1);
+        assert!(err.1.contains("couldn't reach"), "{}", err.1);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]

@@ -330,3 +330,15 @@ pub fn wallet(cmd: WalletCmd, dir: &Path) -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--rpc https://…` must work for the CLI (wallet, validator register/approve).
+    #[test]
+    fn cli_rpc_supports_https() {
+        let err = format!("{:#}", rt().unwrap().block_on(get("https://127.0.0.1:9", "/status")).unwrap_err());
+        assert!(!err.contains("scheme"), "{err}");
+    }
+}

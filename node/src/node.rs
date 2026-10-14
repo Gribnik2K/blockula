@@ -472,6 +472,21 @@ mod tests {
     use super::*;
     use crate::chain::SummonOpts;
 
+    /// Every outbound HTTP path must speak https (public RPCs and Fly endpoints are https-only).
+    /// A request to a closed local port must fail at connect, not with "scheme is not http".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn https_urls_reach_the_connect_stage() {
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+        let sync = format!("{:#}", get_capped(&client, "https://127.0.0.1:9/api/sync?from=1", 1024).await.unwrap_err());
+        assert!(!sync.contains("scheme"), "{sync}");
+        let e = reqwest::get("https://127.0.0.1:9/api/genesis").await.unwrap_err();
+        let e = format!("{:#}", anyhow::Error::from(e));
+        assert!(!e.contains("scheme"), "{e}");
+        let root = home("tls");
+        let join_err = tokio::task::spawn_blocking(move || format!("{:#}", join("https://127.0.0.1:9", &root, None).unwrap_err())).await.unwrap();
+        assert!(!join_err.contains("scheme"), "{join_err}");
+    }
+
     fn home(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("blockula-node-{tag}-{}-{}", crate::chain::now_ms(), std::process::id()))
     }
