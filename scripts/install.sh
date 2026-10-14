@@ -22,7 +22,7 @@ else base=https://github.com/$REPO/releases/download/$VERSION; fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 asset=blockula-$target.tar.gz
-echo "🧛 Downloading $asset…"
+echo "🧛 Downloading ${asset}…"
 curl -fsSL "$base/$asset" -o "$tmp/$asset"
 curl -fsSL "$base/checksums.txt" -o "$tmp/checksums.txt"
 
