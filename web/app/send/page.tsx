@@ -67,6 +67,7 @@ function Send() {
   const [to, setTo] = useState(params.get("to") ?? "");
   const [amount, setAmount] = useState(params.get("amount") ?? "");
   const [memo, setMemo] = useState(params.get("memo") ?? "");
+  const prefilled = params.has("to") || params.has("amount");
   const [review, setReview] = useState<{ tx: Tx; display: string } | null>(null);
   const [sent, setSent] = useState<TxView | null>(null);
   const [busy, setBusy] = useState(false);
@@ -148,8 +149,9 @@ function Send() {
           <dl className="kv">
             <dt>To</dt>
             <dd>
-              {review.display}{" "}
-              {review.display.endsWith(".boo") && <span className="dim mono small">{shortAddr(review.tx.action.type === "transfer" ? review.tx.action.to : "")}</span>}
+              {review.display}
+              {/* Always show the exact address being signed, not just the name. */}
+              <div className="mono small break">{review.tx.action.type === "transfer" ? review.tx.action.to : ""}</div>
             </dd>
             <dt>Amount</dt>
             <dd>{formatFang(amt)}</dd>
@@ -183,6 +185,11 @@ function Send() {
     <main className="narrow stack-lg">
       <Link href="/" className="back">← Home</Link>
       <h1>📤 Send FANG</h1>
+      {prefilled && (
+        <div className="banner">
+          🔗 A link filled in this payment. Double-check who it goes to and how much before sending.
+        </div>
+      )}
       <section className="card stack">
         <label className="field">
           <span>To</span>

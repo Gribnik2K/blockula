@@ -41,6 +41,26 @@ pub enum Action {
     AddKey { key_id: String, label: String, role: KeyRole },
     /// Revoke a key (owner keys only). The last owner key can't be removed.
     RemoveKey { key_id: String },
+    /// Offer to validate: bonds `bond` drops from the sender and creates a *pending* validator
+    /// owned by the sender. `consensus_key` is the validator's hex ML-DSA-65 public key.
+    RegisterValidator {
+        consensus_key: String,
+        p2p_addr: String,
+        http_addr: String,
+        #[serde(with = "u64_str")]
+        bond: u64,
+        /// Proof of possession: hex ML-DSA-65 signature by `consensus_key` over
+        /// `pop_message(chain_id, from, p2p_addr, http_addr)` with context `POP_CONTEXT`.
+        /// Stops anyone registering (squatting) a key they don't hold.
+        #[serde(default)]
+        pop: String,
+    },
+    /// Season 0 allowlist: an admin approves a pending validator (active from the next epoch).
+    ApproveValidator { validator: String },
+    /// Admin removes a validator (it leaves the set at the next epoch boundary).
+    RemoveValidator { validator: String },
+    /// Owner reclaims the bond of a removed validator, one full epoch after it left.
+    Unbond { validator: String },
 }
 
 /// What a key is allowed to do on an account.
@@ -122,15 +142,125 @@ impl Tx {
                 out.push(3);
                 put_str(&mut out, key_id);
             }
+            Action::RegisterValidator { consensus_key, p2p_addr, http_addr, bond, pop } => {
+                out.push(4);
+                put_str(&mut out, consensus_key);
+                put_str(&mut out, p2p_addr);
+                put_str(&mut out, http_addr);
+                out.extend_from_slice(&bond.to_le_bytes());
+                put_str(&mut out, pop);
+            }
+            Action::ApproveValidator { validator } => {
+                out.push(5);
+                put_str(&mut out, validator);
+            }
+            Action::RemoveValidator { validator } => {
+                out.push(6);
+                put_str(&mut out, validator);
+            }
+            Action::Unbond { validator } => {
+                out.push(7);
+                put_str(&mut out, validator);
+            }
         }
         put_str(&mut out, &self.memo);
         out
     }
 
+    /// BLAKE3 over the signed bytes and the *decoded* signature, so re-encoding the hex
+    /// (e.g. uppercase) can't produce a different id for the same tx.
     pub fn id(&self) -> String {
         let mut b = self.signing_bytes();
-        b.extend_from_slice(self.signature.as_bytes());
+        match hex::decode(&self.signature) {
+            Ok(sig) => b.extend_from_slice(&sig),
+            Err(_) => b.extend_from_slice(self.signature.as_bytes()),
+        }
         hex::encode(crypto::hash(&b))
+    }
+
+    /// Size/format rules every tx must meet before anything else looks at it: canonical
+    /// lowercase hex and addresses, capped string fields, and the serialized size limit.
+    pub fn check_format(&self) -> Result<()> {
+        let json_len = serde_json::to_vec(self).map(|v| v.len()).unwrap_or(usize::MAX);
+        if json_len > MAX_TX_BYTES {
+            bail!("transaction too large ({json_len} bytes, max {MAX_TX_BYTES})");
+        }
+        if self.chain_id.len() > 64 {
+            bail!("chain_id too long");
+        }
+        if !crypto::is_address(&self.from) {
+            bail!("`from` must be a lowercase boo1… address");
+        }
+        if self.memo.len() > MAX_MEMO {
+            bail!("memo too long (max {MAX_MEMO} bytes)");
+        }
+        if !crypto::is_lower_hex(&self.public_key) || self.public_key.len() != crypto::PUBLIC_KEY_LEN * 2 {
+            bail!("public_key must be {} bytes of lowercase hex", crypto::PUBLIC_KEY_LEN);
+        }
+        if !crypto::is_lower_hex(&self.signature) || self.signature.len() != crypto::SIGNATURE_LEN * 2 {
+            bail!("signature must be {} bytes of lowercase hex", crypto::SIGNATURE_LEN);
+        }
+        let key_id_ok = |k: &str| k.len() == 64 && crypto::is_lower_hex(k);
+        let addr = |field: &str, v: &str| -> Result<()> {
+            if v.len() > MAX_ADDR {
+                bail!("{field} too long (max {MAX_ADDR} bytes)");
+            }
+            crate::chain::check_host_port(v).with_context(|| field.to_string())
+        };
+        match &self.action {
+            Action::Transfer { to, .. } => {
+                if to.len() > MAX_NAME_FIELD {
+                    bail!("`to` too long (max {MAX_NAME_FIELD} bytes)");
+                }
+                if !crypto::is_address(to) {
+                    normalize_name(to).context("`to` must be a lowercase boo1… address or a .boo name")?;
+                }
+            }
+            Action::RegisterName { name } => {
+                if name.len() > MAX_NAME_FIELD {
+                    bail!("name too long");
+                }
+                normalize_name(name)?;
+            }
+            Action::AddKey { key_id, label, role } => {
+                if !key_id_ok(key_id) {
+                    bail!("key_id must be 32 bytes of lowercase hex (BLAKE3 of the public key)");
+                }
+                if label.len() > MAX_LABEL {
+                    bail!("key label too long (max {MAX_LABEL} bytes)");
+                }
+                if let KeyRole::Session { period_blocks, .. } = role {
+                    if *period_blocks == 0 {
+                        bail!("session period_blocks must be at least 1");
+                    }
+                }
+            }
+            Action::RemoveKey { key_id } => {
+                if !key_id_ok(key_id) {
+                    bail!("key_id must be 32 bytes of lowercase hex");
+                }
+            }
+            Action::RegisterValidator { consensus_key, p2p_addr, http_addr, pop, .. } => {
+                if !crypto::is_lower_hex(consensus_key) || consensus_key.len() != crypto::PUBLIC_KEY_LEN * 2 {
+                    bail!("consensus_key must be an ML-DSA-65 public key ({} bytes of lowercase hex)", crypto::PUBLIC_KEY_LEN);
+                }
+                if !crypto::is_lower_hex(pop) || pop.len() != crypto::SIGNATURE_LEN * 2 {
+                    bail!("pop must be an ML-DSA-65 signature by the consensus key (see `blockula validator register`)");
+                }
+                addr("p2p_addr", p2p_addr)?;
+                if !(http_addr.starts_with("http://") || http_addr.starts_with("https://")) {
+                    addr("http_addr", http_addr)?;
+                } else if http_addr.len() > MAX_ADDR {
+                    bail!("http_addr too long (max {MAX_ADDR} bytes)");
+                }
+            }
+            Action::ApproveValidator { validator } | Action::RemoveValidator { validator } | Action::Unbond { validator } => {
+                if !crypto::is_address(validator) {
+                    bail!("validator must be a lowercase boo1… address");
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn sender(&self) -> Result<String> {
@@ -149,8 +279,8 @@ impl Tx {
     }
 
     pub fn verify_signature(&self) -> Result<()> {
-        if self.memo.len() > 256 {
-            bail!("memo too long (max 256 bytes)");
+        if self.memo.len() > MAX_MEMO {
+            bail!("memo too long (max {MAX_MEMO} bytes)");
         }
         let pk = hex::decode(&self.public_key).context("public_key hex")?;
         let sig = hex::decode(&self.signature).context("signature hex")?;
@@ -178,9 +308,37 @@ pub fn name_price(name: &str) -> u64 {
     }
 }
 
-/// Accepts "jack" or "jack.boo", returns the bare label "jack".
+pub const MAX_TX_BYTES: usize = 64 * 1024;
+pub const MAX_MEMO: usize = 256;
+pub const MAX_LABEL: usize = 64;
+pub const MAX_NAME_FIELD: usize = 64;
+pub const MAX_ADDR: usize = 100;
+/// Transfers that create an account must carry at least this much (makes account spam costly).
+pub const MIN_NEW_ACCOUNT: u64 = DROPS_PER_FANG / 100;
+
+/// Domain separation for validator proofs of possession (FIPS 204 context string).
+pub const POP_CONTEXT: &[u8] = b"blockula/validator-pop/v1";
+
+/// What a validator's consensus key signs to prove possession when registering.
+pub fn pop_message(chain_id: &str, owner: &str, p2p_addr: &str, http_addr: &str) -> Vec<u8> {
+    let mut out = b"BLOCKULA_VALIDATOR_POP_V1".to_vec();
+    for s in [chain_id, owner, p2p_addr, http_addr] {
+        put_str(&mut out, s);
+    }
+    out
+}
+
+/// Accepts "jack" or "jack.boo" (ASCII letters in any case), returns the bare label "jack".
+/// Whitespace and non-ASCII are rejected, not trimmed or folded (e.g. the Kelvin sign 'K'
+/// lowercases to 'k', which would alias names).
 pub fn normalize_name(input: &str) -> Result<String> {
-    let n = input.trim().to_lowercase();
+    if !input.is_ascii() {
+        bail!("names may only use a-z, 0-9 and '-'");
+    }
+    if input.len() > MAX_NAME_FIELD || input.trim() != input {
+        bail!("names can't contain spaces");
+    }
+    let n = input.to_ascii_lowercase();
     let n = n.strip_suffix(NAME_SUFFIX).unwrap_or(&n).to_string();
     if !(3..=32).contains(&n.len()) {
         bail!("names must be 3–32 characters");
@@ -214,7 +372,13 @@ pub struct Block {
     pub state_root: String,
     pub txs: Vec<Tx>,
     pub hash: String,
+    /// Kept for compatibility; certificates live in `certs.bin` now (see chain.rs).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub signature: String,
+    /// Txs (by index into `txs`) that were included and charged their fee, but whose action
+    /// failed at execution (e.g. the balance was spent by an earlier tx in the block).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub failed: std::collections::BTreeMap<usize, String>,
 }
 
 #[cfg(test)]

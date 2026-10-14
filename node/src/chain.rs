@@ -48,6 +48,97 @@ pub struct Genesis {
     pub faucet: bool,
     pub created_at_ms: u64,
     pub allocations: Vec<Allocation>,
+    /// Blocks per epoch. The validator set can only change at epoch boundaries.
+    #[serde(default = "default_epoch_blocks")]
+    pub epoch_blocks: u64,
+    /// Season 0 allowlist: accounts that may approve/remove validators.
+    #[serde(default)]
+    pub validator_admins: Vec<String>,
+    /// Minimum bond (drops) for `register_validator`.
+    #[serde(default = "default_min_bond", with = "u64_str")]
+    pub min_bond: u64,
+    /// Cap on the active set.
+    #[serde(default = "default_max_validators")]
+    pub max_validators: usize,
+}
+
+fn default_epoch_blocks() -> u64 {
+    600
+}
+fn default_min_bond() -> u64 {
+    10_000 * DROPS_PER_FANG
+}
+fn default_max_validators() -> usize {
+    32
+}
+
+/// How many past epochs' validator sets the state keeps (for verifying recent certificates).
+pub const EPOCH_SETS_KEPT: u64 = 8;
+
+/// Genesis constants the state machine needs while applying txs.
+#[derive(Clone, Debug, Default)]
+pub struct Params {
+    pub block_time_ms: u64,
+    pub epoch_blocks: u64,
+    pub admins: Vec<String>,
+    pub min_bond: u64,
+    pub max_validators: usize,
+}
+
+impl Params {
+    /// Longest a session key may stay valid: ~400 days of blocks.
+    pub fn max_session_blocks(&self) -> u64 {
+        400 * 86_400 * 1000 / self.block_time_ms.max(1)
+    }
+
+    pub fn epoch_of(&self, height: u64) -> u64 {
+        height / self.epoch_blocks.max(2)
+    }
+    pub fn is_boundary(&self, height: u64) -> bool {
+        (height + 1) % self.epoch_blocks.max(2) == 0
+    }
+    pub fn last_of(&self, epoch: u64) -> u64 {
+        (epoch + 1) * self.epoch_blocks.max(2) - 1
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidatorStatus {
+    /// Registered and bonded, waiting for an admin.
+    Pending,
+    /// Approved; joins the set at the next epoch boundary (if there's room).
+    Approved,
+    Active,
+    /// Removed by an admin; leaves at the next boundary, bond claimable later.
+    Removed,
+    /// Bond returned.
+    Unbonded,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ValidatorRecord {
+    /// `boo1…` address of the consensus key (the validator's id).
+    pub address: String,
+    /// Account that registered (and owns the bond).
+    pub owner: String,
+    pub consensus_key: String,
+    pub p2p_addr: String,
+    pub http_addr: String,
+    #[serde(with = "u64_str")]
+    pub bond: u64,
+    pub status: ValidatorStatus,
+    pub registered_at: u64,
+    pub approved_at: Option<u64>,
+    pub approved_by: Option<String>,
+    /// First epoch it is (or was) in the active set.
+    pub active_from: Option<u64>,
+    pub removed_at: Option<u64>,
+    pub removed_by: Option<String>,
+    /// Last epoch in the active set (set when it leaves).
+    pub active_until: Option<u64>,
+    /// Bond can be reclaimed from this epoch on.
+    pub unbond_epoch: Option<u64>,
 }
 
 impl Genesis {
@@ -55,12 +146,39 @@ impl Genesis {
         self.validators.iter().any(|v| v.address == addr)
     }
 
+    pub fn params(&self) -> Params {
+        Params { block_time_ms: self.block_time_ms, epoch_blocks: self.epoch_blocks, admins: self.validator_admins.clone(), min_bond: self.min_bond, max_validators: self.max_validators }
+    }
+
     pub fn initial_state(&self) -> State {
-        let mut state = State::default();
+        let mut state = State { params: self.params(), ..Default::default() };
         for a in &self.allocations {
             state.credit(&a.address, a.amount);
             state.supply += a.amount;
         }
+        for v in &self.validators {
+            state.validators.insert(
+                v.address.clone(),
+                ValidatorRecord {
+                    address: v.address.clone(),
+                    owner: v.address.clone(),
+                    consensus_key: v.public_key.clone(),
+                    p2p_addr: v.p2p_addr.clone(),
+                    http_addr: v.http_addr.clone(),
+                    bond: 0,
+                    status: ValidatorStatus::Active,
+                    registered_at: 0,
+                    approved_at: Some(0),
+                    approved_by: None,
+                    active_from: Some(0),
+                    removed_at: None,
+                    removed_by: None,
+                    active_until: None,
+                    unbond_epoch: None,
+                },
+            );
+        }
+        state.active_sets.insert(0, self.validators.iter().map(|v| v.address.clone()).collect());
         state
     }
 
@@ -72,6 +190,93 @@ impl Genesis {
         }
         Ok(serde_json::from_value(v)?)
     }
+}
+
+/// `host:port`, where host is an IP or a DNS name.
+pub fn check_host_port(s: &str) -> Result<()> {
+    let (host, port) = s.rsplit_once(':').ok_or_else(|| anyhow!("expected host:port"))?;
+    port.parse::<u16>().map_err(|_| anyhow!("bad port"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() || host.len() > 253 || !host.chars().all(|c| c.is_ascii_alphanumeric() || ".-:".contains(c)) {
+        bail!("bad host");
+    }
+    Ok(())
+}
+
+/// A validator's HTTP endpoint: `host:port` or a full `http(s)://…` URL.
+pub fn check_http_addr(s: &str) -> Result<()> {
+    if s.len() > MAX_ADDR {
+        bail!("too long (max {MAX_ADDR} bytes)");
+    }
+    if let Some(rest) = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")) {
+        let host = rest.split('/').next().unwrap_or_default();
+        if host.is_empty() || !host.chars().all(|c| c.is_ascii_alphanumeric() || ".-:[]".contains(c)) {
+            bail!("bad URL");
+        }
+        return Ok(());
+    }
+    check_host_port(s)
+}
+
+/// `http_addr` (host:port or URL) → base URL.
+pub fn http_url(addr: &str) -> String {
+    if addr.starts_with("http://") || addr.starts_with("https://") { addr.trim_end_matches('/').to_string() } else { format!("http://{addr}") }
+}
+
+/// Checks a validator registration's proof of possession of its consensus key.
+pub fn verify_pop(chain_id: &str, owner: &str, consensus_key: &str, p2p_addr: &str, http_addr: &str, pop: &str) -> Result<()> {
+    use commonware_cryptography::Verifier as _;
+    let pk = hex::decode(consensus_key).ok().and_then(|b| crate::pq::PublicKey::from_bytes(&b)).ok_or_else(|| anyhow!("bad consensus key"))?;
+    let sig = hex::decode(pop).ok().and_then(|b| commonware_codec::DecodeExt::decode(b.as_slice()).ok()).ok_or_else(|| anyhow!("pop must be a hex ML-DSA-65 signature"))?;
+    if !pk.verify(POP_CONTEXT, &pop_message(chain_id, owner, p2p_addr, http_addr), &sig) {
+        bail!("pop doesn't verify: the consensus key must sign this registration (owner, addresses)");
+    }
+    Ok(())
+}
+
+/// Signs a proof of possession with a validator's consensus key (seed).
+pub fn make_pop(seed: [u8; 32], chain_id: &str, owner: &str, p2p_addr: &str, http_addr: &str) -> String {
+    use commonware_cryptography::Signer as _;
+    let key = crate::pq::PrivateKey::from_seed_bytes(seed);
+    hex::encode(key.sign(POP_CONTEXT, &pop_message(chain_id, owner, p2p_addr, http_addr)).as_ref())
+}
+
+/// Undo log for state changes: the old value of every entry touched (first touch wins).
+#[derive(Default)]
+pub struct Journal {
+    accounts: HashMap<String, Option<Account>>,
+    names: HashMap<String, Option<NameRecord>>,
+    validators: HashMap<String, Option<ValidatorRecord>>,
+    scalars: Option<(u64, u64)>,
+}
+
+impl Journal {
+    pub fn absorb_pub(&mut self, other: Journal) {
+        self.absorb(other)
+    }
+
+    /// Folds a nested journal in, keeping the oldest values.
+    fn absorb(&mut self, other: Journal) {
+        for (k, v) in other.accounts {
+            self.accounts.entry(k).or_insert(v);
+        }
+        for (k, v) in other.names {
+            self.names.entry(k).or_insert(v);
+        }
+        for (k, v) in other.validators {
+            self.validators.entry(k).or_insert(v);
+        }
+        if self.scalars.is_none() {
+            self.scalars = other.scalars;
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Applied,
+    /// Included and charged, but the action failed (reason).
+    Failed(String),
 }
 
 /// Free localhost port, picked by the OS. Used when summoning local testnets.
@@ -114,11 +319,65 @@ pub struct State {
     pub names: BTreeMap<String, NameRecord>,
     pub supply: u64,
     pub burned: u64,
+    /// Every validator ever registered (genesis ones included), by validator address.
+    pub validators: BTreeMap<String, ValidatorRecord>,
+    /// Active set per epoch (validator addresses), for the last `EPOCH_SETS_KEPT` epochs.
+    pub active_sets: BTreeMap<u64, Vec<String>>,
+    pub params: Params,
 }
 
 impl State {
     pub fn account(&self, addr: &str) -> Account {
         self.accounts.get(addr).cloned().unwrap_or_default()
+    }
+
+    /// Active set for an epoch (validator records, in set order), if known.
+    pub fn active_set(&self, epoch: u64) -> Option<Vec<&ValidatorRecord>> {
+        self.active_sets.get(&epoch).map(|s| s.iter().filter_map(|a| self.validators.get(a)).collect())
+    }
+
+    /// The set epoch `epoch + 1` would get if the boundary were now: current members that
+    /// weren't removed, then approved validators in approval order, capped. Never empty.
+    pub fn next_set(&self, epoch: u64) -> Vec<String> {
+        let current = self.active_sets.get(&epoch).cloned().unwrap_or_default();
+        let mut next: Vec<String> = current.iter().filter(|a| self.validators.get(*a).is_some_and(|v| v.status == ValidatorStatus::Active)).cloned().collect();
+        let mut approved: Vec<&ValidatorRecord> = self.validators.values().filter(|v| v.status == ValidatorStatus::Approved).collect();
+        approved.sort_by_key(|v| (v.approved_at, v.address.clone()));
+        for v in approved {
+            if next.len() >= self.params.max_validators.max(1) {
+                break;
+            }
+            next.push(v.address.clone());
+        }
+        if next.is_empty() { current } else { next }
+    }
+
+    /// Runs after the last block of `epoch`: fixes the set for `epoch + 1`.
+    pub fn end_epoch(&mut self, epoch: u64) {
+        let next = self.next_set(epoch);
+        let current = self.active_sets.get(&epoch).cloned().unwrap_or_default();
+        for a in &next {
+            let v = self.validators.get_mut(a).expect("set member exists");
+            if v.status == ValidatorStatus::Approved {
+                v.status = ValidatorStatus::Active;
+                v.active_from = Some(epoch + 1);
+            }
+        }
+        for a in &current {
+            if !next.contains(a) {
+                if let Some(v) = self.validators.get_mut(a) {
+                    v.active_until = Some(epoch);
+                    if v.status == ValidatorStatus::Removed {
+                        v.unbond_epoch = Some(epoch + 2);
+                    }
+                }
+            }
+        }
+        self.active_sets.insert(epoch + 1, next);
+        while self.active_sets.len() as u64 > EPOCH_SETS_KEPT {
+            let first = *self.active_sets.keys().next().unwrap();
+            self.active_sets.remove(&first);
+        }
     }
 
     pub fn resolve(&self, to: &str) -> Result<String> {
@@ -144,8 +403,28 @@ impl State {
         BTreeMap::from([(original, KeyRecord { label: "original key".into(), role: KeyRole::Owner, added_at: 0, spent: 0, window_start: 0 })])
     }
 
-    fn debit(&mut self, addr: &str, amount: u64) -> Result<()> {
-        let acct = self.accounts.entry(addr.to_string()).or_default();
+    fn credit(&mut self, addr: &str, amount: u64) {
+        self.accounts.entry(addr.to_string()).or_default().balance += amount;
+    }
+
+    // ---- journaled mutation helpers: record the old value on first touch, then mutate ----
+
+    fn acct_mut(&mut self, j: &mut Journal, addr: &str) -> &mut Account {
+        if !j.accounts.contains_key(addr) {
+            j.accounts.insert(addr.to_string(), self.accounts.get(addr).cloned());
+        }
+        self.accounts.entry(addr.to_string()).or_default()
+    }
+
+    fn validator_mut(&mut self, j: &mut Journal, addr: &str) -> Option<&mut ValidatorRecord> {
+        if !j.validators.contains_key(addr) {
+            j.validators.insert(addr.to_string(), self.validators.get(addr).cloned());
+        }
+        self.validators.get_mut(addr)
+    }
+
+    fn j_debit(&mut self, j: &mut Journal, addr: &str, amount: u64) -> Result<()> {
+        let acct = self.acct_mut(j, addr);
         if acct.balance < amount {
             bail!("insufficient balance: has {}, needs {}", fmt_fang(acct.balance), fmt_fang(amount));
         }
@@ -153,20 +432,66 @@ impl State {
         Ok(())
     }
 
-    fn credit(&mut self, addr: &str, amount: u64) {
-        self.accounts.entry(addr.to_string()).or_default().balance += amount;
+    fn j_credit(&mut self, j: &mut Journal, addr: &str, amount: u64) {
+        self.acct_mut(j, addr).balance += amount;
     }
 
-    /// Validates and applies a tx. On error the state is left untouched.
-    pub fn apply(&mut self, tx: &Tx, chain_id: &str, proposer: &str, height: u64) -> Result<()> {
+    fn j_scalars(&mut self, j: &mut Journal) {
+        if j.scalars.is_none() {
+            j.scalars = Some((self.supply, self.burned));
+        }
+    }
+
+    /// Undoes everything recorded in `j`.
+    pub fn rollback(&mut self, j: Journal) {
+        for (k, old) in j.accounts {
+            match old {
+                Some(v) => {
+                    self.accounts.insert(k, v);
+                }
+                None => {
+                    self.accounts.remove(&k);
+                }
+            }
+        }
+        for (k, old) in j.names {
+            match old {
+                Some(v) => {
+                    self.names.insert(k, v);
+                }
+                None => {
+                    self.names.remove(&k);
+                }
+            }
+        }
+        for (k, old) in j.validators {
+            match old {
+                Some(v) => {
+                    self.validators.insert(k, v);
+                }
+                None => {
+                    self.validators.remove(&k);
+                }
+            }
+        }
+        if let Some((supply, burned)) = j.scalars {
+            self.supply = supply;
+            self.burned = burned;
+        }
+    }
+
+    /// Checks that decide whether a tx can be included at all. No state changes.
+    fn admit(&self, tx: &Tx, chain_id: &str, height: u64, full_checks: bool) -> Result<(String, String, KeyRecord)> {
         if tx.chain_id != chain_id {
             bail!("wrong chain_id: expected {chain_id}");
         }
-        tx.verify_signature()?;
+        if full_checks {
+            tx.check_format()?;
+        }
         let sender = tx.sender()?;
         let signer = tx.signer_key_id()?;
         let keys = self.keys_of(&sender);
-        let key = keys.get(&signer).ok_or_else(|| anyhow!("this key isn't authorized on {}", short(&sender)))?;
+        let key = keys.get(&signer).cloned().ok_or_else(|| anyhow!("this key isn't authorized on {}", short(&sender)))?;
         let min = min_fee(tx.size());
         if tx.fee < min {
             bail!("fee too low: minimum is {} drops", min);
@@ -175,55 +500,117 @@ impl State {
         if tx.nonce != acct.nonce {
             bail!("bad nonce: expected {}, got {}", acct.nonce, tx.nonce);
         }
-        let mut next = self.clone();
+        if acct.balance < tx.fee {
+            bail!("insufficient balance for the fee: has {}, needs {}", fmt_fang(acct.balance), fmt_fang(tx.fee));
+        }
         if let KeyRole::Session { limit, period_blocks, expires_at } = key.role {
             if height > expires_at {
                 bail!("session key expired at block {expires_at}");
             }
             let Action::Transfer { amount, .. } = &tx.action else { bail!("session keys can only send transfers") };
-            let mut rec = key.clone();
+            let spent = if height >= key.window_start.saturating_add(period_blocks) { 0 } else { key.spent };
+            if spent.saturating_add(*amount).saturating_add(tx.fee) > limit {
+                bail!("session key limit reached: {} per {period_blocks} blocks", fmt_fang(limit));
+            }
+        }
+        Ok((sender, signer, key))
+    }
+
+    /// Validates and applies a tx (signatures are checked before txs reach the state machine:
+    /// at admission and in block verification).
+    ///
+    /// * `Err`: not includable (bad nonce, fee, key…); state untouched.
+    /// * `Ok(Applied)`: done.
+    /// * `Ok(Failed(reason))`: the fee was charged and the nonce used, but the action failed and
+    ///   its effects were rolled back (so failing txs aren't free).
+    pub fn apply(&mut self, tx: &Tx, chain_id: &str, proposer: &str, height: u64) -> Result<Outcome> {
+        let mut j = Journal::default();
+        self.apply_j(&mut j, tx, chain_id, proposer, height, true)
+    }
+
+    /// `apply`, recording every change in `j` so the caller can roll back (dry runs, mempool
+    /// checks, proposals) without cloning the state.
+    pub fn apply_j(&mut self, j: &mut Journal, tx: &Tx, chain_id: &str, proposer: &str, height: u64, full_checks: bool) -> Result<Outcome> {
+        let (sender, signer, key) = self.admit(tx, chain_id, height, full_checks)?;
+        let min = min_fee(tx.size());
+        // Fee phase (always sticks once admitted).
+        if let KeyRole::Session { period_blocks, .. } = key.role {
+            let mut keys = self.keys_of(&sender);
+            let rec = keys.get_mut(&signer).unwrap();
             if height >= rec.window_start.saturating_add(period_blocks) {
                 rec.spent = 0;
                 rec.window_start = height;
             }
-            rec.spent = rec.spent.saturating_add(*amount).saturating_add(tx.fee);
-            if rec.spent > limit {
-                bail!("session key limit reached: {} per {period_blocks} blocks", fmt_fang(limit));
-            }
-            let acct = next.accounts.entry(sender.clone()).or_default();
-            acct.keys = keys.clone();
-            acct.keys.insert(signer.clone(), rec);
+            rec.spent = rec.spent.saturating_add(tx.fee);
+            self.acct_mut(j, &sender).keys = keys;
         }
-        next.debit(&sender, tx.fee)?;
-        next.burned += min;
-        next.supply -= min;
-        next.credit(proposer, tx.fee - min);
+        self.j_debit(j, &sender, tx.fee)?;
+        self.j_scalars(j);
+        self.burned += min;
+        self.supply -= min;
+        self.j_credit(j, proposer, tx.fee - min);
+        self.acct_mut(j, &sender).nonce += 1;
+        // Action phase (rolled back on failure).
+        let mut aj = Journal::default();
+        match self.apply_action(&mut aj, tx, &sender, &signer, &key, height) {
+            Ok(()) => {
+                j.absorb(aj);
+                Ok(Outcome::Applied)
+            }
+            Err(e) => {
+                self.rollback(aj);
+                Ok(Outcome::Failed(e.to_string()))
+            }
+        }
+    }
+
+    fn apply_action(&mut self, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &KeyRecord, height: u64) -> Result<()> {
+        let sender = sender.to_string();
         match &tx.action {
             Action::Transfer { to, amount } => {
-                let to = next.resolve(to)?;
-                next.debit(&sender, *amount)?;
-                next.credit(&to, *amount);
+                let to = self.resolve(to)?;
+                if !self.accounts.contains_key(&to) && *amount < MIN_NEW_ACCOUNT {
+                    bail!("sending to a new account needs at least {}", fmt_fang(MIN_NEW_ACCOUNT));
+                }
+                if let KeyRole::Session { .. } = key.role {
+                    let mut keys = self.account(&sender).keys;
+                    if let Some(rec) = keys.get_mut(signer) {
+                        rec.spent = rec.spent.saturating_add(*amount);
+                    }
+                    self.acct_mut(j, &sender).keys = keys;
+                }
+                self.j_debit(j, &sender, *amount)?;
+                self.j_credit(j, &to, *amount);
             }
             Action::RegisterName { name } => {
                 let n = normalize_name(name)?;
-                if next.names.contains_key(&n) {
+                if self.names.contains_key(&n) {
                     bail!("{n}{NAME_SUFFIX} is already taken");
                 }
-                next.debit(&sender, name_price(&n))?;
-                next.credit(&treasury(), name_price(&n));
-                next.names.insert(n.clone(), NameRecord { name: n, owner: sender.clone(), registered_at: height });
+                self.j_debit(j, &sender, name_price(&n))?;
+                self.j_credit(j, &treasury(), name_price(&n));
+                j.names.entry(n.clone()).or_insert(None);
+                self.names.insert(n.clone(), NameRecord { name: n, owner: sender.clone(), registered_at: height });
             }
             Action::AddKey { key_id, label, role } => {
                 if key.role != KeyRole::Owner {
                     bail!("only owner keys can add keys");
                 }
-                if key_id.len() != 64 || hex::decode(key_id).is_err() {
-                    bail!("key_id must be 32 bytes hex (BLAKE3 of the public key)");
+                if key_id.len() != 64 || !crypto::is_lower_hex(key_id) {
+                    bail!("key_id must be 32 bytes of lowercase hex (BLAKE3 of the public key)");
                 }
-                if label.len() > 64 {
-                    bail!("key label too long (max 64 bytes)");
+                if label.len() > MAX_LABEL {
+                    bail!("key label too long (max {MAX_LABEL} bytes)");
                 }
-                let mut keys = keys.clone();
+                if let KeyRole::Session { period_blocks, expires_at, .. } = role {
+                    if *period_blocks == 0 {
+                        bail!("session period_blocks must be at least 1");
+                    }
+                    if expires_at.saturating_sub(height) > self.params.max_session_blocks() {
+                        bail!("session keys can last at most {} blocks (~400 days)", self.params.max_session_blocks());
+                    }
+                }
+                let mut keys = self.keys_of(&sender);
                 if keys.contains_key(key_id) {
                     bail!("that key is already on this account");
                 }
@@ -231,23 +618,114 @@ impl State {
                     bail!("accounts can hold at most {MAX_KEYS} keys");
                 }
                 keys.insert(key_id.clone(), KeyRecord { label: label.clone(), role: role.clone(), added_at: height, spent: 0, window_start: height });
-                next.accounts.entry(sender.clone()).or_default().keys = keys;
+                self.acct_mut(j, &sender).keys = keys;
             }
             Action::RemoveKey { key_id } => {
                 if key.role != KeyRole::Owner {
                     bail!("only owner keys can remove keys");
                 }
-                let mut keys = keys.clone();
+                let mut keys = self.keys_of(&sender);
                 let removed = keys.remove(key_id).ok_or_else(|| anyhow!("no such key on this account"))?;
                 if removed.role == KeyRole::Owner && !keys.values().any(|k| k.role == KeyRole::Owner) {
                     bail!("can't remove the last owner key — you'd lock yourself out");
                 }
-                next.accounts.entry(sender.clone()).or_default().keys = keys;
+                self.acct_mut(j, &sender).keys = keys;
+            }
+            Action::RegisterValidator { consensus_key, p2p_addr, http_addr, bond, pop } => {
+                if key.role != KeyRole::Owner {
+                    bail!("only owner keys can register validators");
+                }
+                if !crypto::is_lower_hex(consensus_key) {
+                    bail!("consensus_key must be lowercase hex");
+                }
+                let pk = hex::decode(consensus_key).map_err(|_| anyhow!("consensus_key must be hex"))?;
+                if pk.len() != crypto::PUBLIC_KEY_LEN {
+                    bail!("consensus_key must be an ML-DSA-65 public key ({} bytes)", crypto::PUBLIC_KEY_LEN);
+                }
+                check_host_port(p2p_addr).context("p2p_addr")?;
+                check_http_addr(http_addr).context("http_addr")?;
+                if *bond < self.params.min_bond {
+                    bail!("bond must be at least {}", fmt_fang(self.params.min_bond));
+                }
+                let address = crypto::address_from_public_key(&pk);
+                if let Some(v) = self.validators.get(&address) {
+                    if v.status != ValidatorStatus::Unbonded {
+                        bail!("that consensus key is already registered");
+                    }
+                }
+                verify_pop(&tx.chain_id, &sender, consensus_key, p2p_addr, http_addr, pop)?;
+                self.j_debit(j, &sender, *bond)?;
+                self.validator_mut(j, &address);
+                self.validators.insert(
+                    address.clone(),
+                    ValidatorRecord { address, owner: sender.clone(), consensus_key: consensus_key.clone(), p2p_addr: p2p_addr.clone(), http_addr: http_addr.clone(), bond: *bond, status: ValidatorStatus::Pending, registered_at: height, approved_at: None, approved_by: None, active_from: None, removed_at: None, removed_by: None, active_until: None, unbond_epoch: None },
+                );
+            }
+            Action::ApproveValidator { validator } => {
+                if !self.params.admins.contains(&sender) {
+                    bail!("only validator admins can approve validators");
+                }
+                let v = self.validator_mut(j, validator).ok_or_else(|| anyhow!("no such validator"))?;
+                if v.status != ValidatorStatus::Pending {
+                    bail!("validator is {:?}, not pending", v.status);
+                }
+                v.status = ValidatorStatus::Approved;
+                v.approved_at = Some(height);
+                v.approved_by = Some(sender.clone());
+            }
+            Action::RemoveValidator { validator } => {
+                if !self.params.admins.contains(&sender) {
+                    bail!("only validator admins can remove validators");
+                }
+                let epoch = self.params.epoch_of(height);
+                let v = self.validator_mut(j, validator).ok_or_else(|| anyhow!("no such validator"))?;
+                if !matches!(v.status, ValidatorStatus::Pending | ValidatorStatus::Approved | ValidatorStatus::Active) {
+                    bail!("validator is already {:?}", v.status);
+                }
+                let was_active = v.status == ValidatorStatus::Active;
+                v.status = ValidatorStatus::Removed;
+                v.removed_at = Some(height);
+                v.removed_by = Some(sender.clone());
+                if !was_active {
+                    v.unbond_epoch = Some(epoch + 1);
+                }
+                // Never let the set empty out.
+                if !self.validators.values().any(|v| matches!(v.status, ValidatorStatus::Active | ValidatorStatus::Approved)) {
+                    bail!("can't remove the last validator");
+                }
+            }
+            Action::Unbond { validator } => {
+                let epoch = self.params.epoch_of(height);
+                let v = self.validators.get(validator).ok_or_else(|| anyhow!("no such validator"))?;
+                if v.owner != sender {
+                    bail!("only the account that registered this validator can unbond it");
+                }
+                if v.status != ValidatorStatus::Removed {
+                    bail!("only removed validators can unbond");
+                }
+                match v.unbond_epoch {
+                    Some(e) if epoch >= e => {}
+                    Some(e) => bail!("bond unlocks at epoch {e} (now {epoch})"),
+                    None => bail!("validator hasn't left the active set yet"),
+                }
+                let v = self.validator_mut(j, validator).unwrap();
+                let bond = v.bond;
+                v.bond = 0;
+                v.status = ValidatorStatus::Unbonded;
+                self.j_credit(j, &sender, bond);
             }
         }
-        next.accounts.get_mut(&sender).unwrap().nonce += 1;
-        *self = next;
         Ok(())
+    }
+
+    /// What admitting this tx reserves from the sender's balance (fee + amount moved out).
+    pub fn tx_debit(tx: &Tx) -> u64 {
+        tx.fee.saturating_add(match &tx.action {
+            Action::Transfer { amount, .. } => *amount,
+            Action::RegisterName { name } => normalize_name(name).map(|n| name_price(&n)).unwrap_or(0),
+            Action::RegisterValidator { bond, .. } => *bond,
+            _ => 0,
+        })
     }
 
     pub fn root(&self) -> String {
@@ -265,10 +743,20 @@ impl State {
             h.update(n.as_bytes());
             h.update(r.owner.as_bytes());
         }
+        // Pre-validator-registry chains (only genesis validators, never changed) keep their roots.
+        if self.validators.values().any(|v| v.status != ValidatorStatus::Active || v.active_from != Some(0)) || self.active_sets.len() > 1 {
+            for v in self.validators.values() {
+                h.update(serde_json::to_string(v).unwrap().as_bytes());
+            }
+            for (e, set) in &self.active_sets {
+                h.update(&e.to_le_bytes());
+                h.update(set.join(",").as_bytes());
+            }
+        }
         h.finalize().to_hex().to_string()
     }
 
-    pub fn describe(&self, tx: &Tx) -> String {
+    pub fn describe(&self, tx: &Tx, height: Option<u64>) -> String {
         let who = |a: &str| self.primary_name(a).unwrap_or_else(|| short(a));
         let from = tx.sender().map(|s| who(&s)).unwrap_or_default();
         match &tx.action {
@@ -285,6 +773,31 @@ impl State {
                 format!("{from} let “{label}” spend up to {} every {period_blocks} blocks", fmt_fang(*limit))
             }
             Action::RemoveKey { key_id } => format!("{from} revoked key {}…", &key_id[..key_id.len().min(10)]),
+            Action::RegisterValidator { consensus_key, bond, .. } => {
+                let v = hex::decode(consensus_key).map(|pk| short(&crypto::address_from_public_key(&pk))).unwrap_or_default();
+                format!("{from} bonded {} to run validator {v} (pending admin approval)", fmt_fang(*bond))
+            }
+            Action::ApproveValidator { validator } => {
+                let when = match self.validators.get(validator).and_then(|v| v.active_from) {
+                    Some(e) => format!("active from epoch {e}"),
+                    None => match height {
+                        Some(h) => format!("joins at epoch {} if there's room", self.params.epoch_of(h) + 1),
+                        None => "joins at the next epoch".into(),
+                    },
+                };
+                format!("{from} approved validator {}, {when}", who(validator))
+            }
+            Action::RemoveValidator { validator } => {
+                let when = match self.validators.get(validator).and_then(|v| v.active_until) {
+                    Some(e) => format!("last active in epoch {e}"),
+                    None => "leaves at the next epoch boundary".into(),
+                };
+                format!("{from} removed validator {}, {when}", who(validator))
+            }
+            Action::Unbond { validator } => {
+                let amount = self.validators.get(validator).map(|_| String::new()).unwrap_or_default();
+                format!("{from} reclaimed the bond of validator {}{amount}", who(validator))
+            }
         }
     }
 }
@@ -300,6 +813,100 @@ pub enum Role {
     FullNode,
 }
 
+pub struct SummonOpts {
+    pub chain_id: String,
+    pub faucet: bool,
+    pub block_time_ms: u64,
+    pub validators: usize,
+    /// HTTP port for the first validator (others get free ports).
+    pub http_port: Option<u16>,
+    /// Season 0 validator admins; defaults to the first validator's account.
+    pub admins: Vec<String>,
+    pub epoch_blocks: u64,
+    /// Minimum validator bond in drops. `None`: 50 FANG on faucet chains (one faucet drip
+    /// covers it), 10,000 FANG otherwise.
+    pub min_bond: Option<u64>,
+}
+
+impl SummonOpts {
+    pub fn new(chain_id: &str, validators: usize) -> Self {
+        Self { chain_id: chain_id.into(), faucet: true, block_time_ms: 1000, validators, http_port: None, admins: vec![], epoch_blocks: default_epoch_blocks(), min_bond: None }
+    }
+}
+
+/// Blocks kept in memory; older ones are read from `blocks.jsonl` on demand.
+pub const RECENT_BLOCKS: usize = 2_048;
+/// During replay, verify the state root every this many blocks (plus the last one).
+pub const REPLAY_ROOT_CHECK: u64 = 1_000;
+/// Certificates are stored on disk for these heights (plus every epoch's last block) …
+pub const CERT_CHECKPOINT: u64 = 100;
+/// … and kept in memory for this many recent heights.
+pub const RECENT_CERTS: usize = 1_024;
+/// Mempool txs not included within this many blocks are dropped.
+pub const MEMPOOL_TTL_BLOCKS: u64 = 600;
+/// Recently failed/dropped tx ids remembered for `/api/tx/{id}`.
+pub const RECENT_FAILED: usize = 10_000;
+/// Max faucet drips waiting in the mempool (kept below `MAX_PENDING_PER_SENDER`).
+pub const FAUCET_MAX_PENDING: usize = 32;
+
+/// Append-only file of length-prefixed records with an in-memory offset index.
+struct RecordFile {
+    file: File,
+    len: u64,
+}
+
+impl RecordFile {
+    fn open(path: &Path) -> Result<(Self, Vec<(u64, u64, u32)>)> {
+        let mut file = OpenOptions::new().create(true).read(true).append(true).open(path)?;
+        let mut index = vec![];
+        let mut buf = vec![];
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0))?;
+        file.read_to_end(&mut buf)?;
+        let mut pos = 0usize;
+        while pos + 12 <= buf.len() {
+            let key = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+            let len = u32::from_le_bytes(buf[pos + 8..pos + 12].try_into().unwrap());
+            if pos + 12 + len as usize > buf.len() {
+                break; // torn write at the tail
+            }
+            index.push((key, (pos + 12) as u64, len));
+            pos += 12 + len as usize;
+        }
+        if pos != buf.len() {
+            file.set_len(pos as u64)?;
+        }
+        Ok((Self { file, len: pos as u64 }, index))
+    }
+
+    fn append(&mut self, key: u64, bytes: &[u8]) -> Result<(u64, u32)> {
+        let mut rec = Vec::with_capacity(12 + bytes.len());
+        rec.extend_from_slice(&key.to_le_bytes());
+        rec.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        rec.extend_from_slice(bytes);
+        self.file.write_all(&rec)?;
+        let at = self.len + 12;
+        self.len += rec.len() as u64;
+        Ok((at, bytes.len() as u32))
+    }
+
+    fn read(&self, at: u64, len: u32) -> Option<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0u8; len as usize];
+        self.file.read_exact_at(&mut buf, at).ok()?;
+        Some(buf)
+    }
+
+    fn sync(&self) -> Result<()> {
+        Ok(self.file.sync_data()?)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PoolEntry {
+    added_at: u64,
+}
+
 pub struct Chain {
     pub home: PathBuf,
     pub genesis: Genesis,
@@ -310,15 +917,33 @@ pub struct Chain {
     pub genesis_root: String,
     /// Hash of the genesis consensus block (parent of block 1).
     pub genesis_hash: String,
-    pub blocks: Vec<Block>,
+    /// Executed blocks: the last `RECENT_BLOCKS` in memory, the rest on disk.
+    recent: std::collections::VecDeque<Block>,
+    block_offsets: Vec<u64>,
+    block_by_hash: HashMap<u64, u64>,
+    height: u64,
+    last_hash: String,
+    /// Exact consensus block bytes per height (served to joining nodes).
+    cblocks: RecordFile,
+    cblock_index: Vec<(u64, u32)>,
+    /// Finalization certificates: checkpoints on disk, recent ones in memory.
+    certs: RecordFile,
+    cert_index: BTreeMap<u64, (u64, u32)>,
+    recent_certs: BTreeMap<u64, Vec<u8>>,
     pub tx_index: HashMap<String, (u64, usize)>,
     pub history: HashMap<String, Vec<String>>,
     pub mempool: Vec<Tx>,
-    /// Highest finalized height we know of (may be ahead of `height()` while catching up).
+    pool: HashMap<String, PoolEntry>,
+    pending: HashMap<String, (usize, u64)>,
+    /// id → (reason, height) for txs that failed at execution or were dropped from the mempool.
+    recent_failed: HashMap<String, (String, u64)>,
+    failed_order: std::collections::VecDeque<String>,
+    /// Highest finalized height proven by a certificate we verified or saw from consensus.
     pub finalized_tip: u64,
     /// Outbound mempool gossip (validators) — every accepted tx is pushed here.
     pub gossip: Option<futures::channel::mpsc::UnboundedSender<Tx>>,
     log: File,
+    log_len: u64,
 }
 
 /// A finalized block handed to `Chain::execute`, straight from consensus.
@@ -329,15 +954,41 @@ pub struct Finalized {
     pub timestamp_ms: u64,
     pub proposer: String,
     pub txs: Vec<Tx>,
-    /// hex-encoded finalization certificate, when we saw it.
-    pub certificate: String,
+    /// The exact consensus block bytes (stored so this node can serve `/api/sync`).
+    pub cblock: Vec<u8>,
+    /// Encoded finalization certificate, when we have it.
+    pub certificate: Option<Vec<u8>>,
+}
+
+/// Writes a secret file readable only by its owner, refusing to overwrite (no chmod race).
+pub fn write_secret(path: &Path, contents: &str) -> Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).with_context(|| format!("creating {}", path.display()))?;
+    f.write_all(contents.as_bytes())?;
+    f.sync_all()?;
+    Ok(())
 }
 
 impl Chain {
     /// Creates a new chain. With one validator, `home` gets genesis.json + validator.key.
     /// With N > 1, `home/v0 … home/v{N-1}` each get the shared genesis and their own key,
     /// with localhost ports picked automatically.
-    pub fn summon(home: &Path, chain_id: &str, faucet: bool, block_time_ms: u64, validators: usize, http_port: Option<u16>) -> Result<Vec<PathBuf>> {
+    pub fn summon(home: &Path, o: &SummonOpts) -> Result<Vec<PathBuf>> {
+        let (chain_id, faucet, block_time_ms, validators, http_port) = (o.chain_id.as_str(), o.faucet, o.block_time_ms, o.validators, o.http_port);
+        if o.epoch_blocks < 2 {
+            bail!("epoch_blocks must be at least 2");
+        }
+        for a in &o.admins {
+            if !crypto::is_address(a) {
+                bail!("admin {a} is not a lowercase boo1… address");
+            }
+        }
         if validators == 0 {
             bail!("need at least one validator");
         }
@@ -353,12 +1004,26 @@ impl Chain {
         let per_validator = 1_000_000_000 * DROPS_PER_FANG / validators as u64;
         let mut allocations: Vec<Allocation> = keys.iter().map(|k| Allocation { address: k.address(), amount: per_validator }).collect();
         allocations.push(Allocation { address: treasury(), amount: 100_000_000 * DROPS_PER_FANG });
-        let genesis = Genesis { chain_id: chain_id.to_string(), token: "FANG".into(), decimals: DECIMALS, block_time_ms, validators: infos, faucet, created_at_ms: now_ms(), allocations };
+        let validator_admins = if o.admins.is_empty() { vec![keys[0].address()] } else { o.admins.clone() };
+        let genesis = Genesis {
+            chain_id: chain_id.to_string(),
+            token: "FANG".into(),
+            decimals: DECIMALS,
+            block_time_ms,
+            validators: infos,
+            faucet,
+            created_at_ms: now_ms(),
+            allocations,
+            epoch_blocks: o.epoch_blocks,
+            validator_admins,
+            min_bond: o.min_bond.unwrap_or(if faucet { 50 * DROPS_PER_FANG } else { default_min_bond() }),
+            max_validators: default_max_validators(),
+        };
         let homes: Vec<PathBuf> = if validators == 1 { vec![home.to_path_buf()] } else { (0..validators).map(|i| home.join(format!("v{i}"))).collect() };
         for (h, k) in homes.iter().zip(&keys) {
             fs::create_dir_all(h)?;
             fs::write(h.join("genesis.json"), serde_json::to_string_pretty(&genesis)?)?;
-            fs::write(h.join("validator.key"), k.seed_hex())?;
+            write_secret(&h.join("validator.key"), &k.seed_hex())?;
         }
         if validators > 1 {
             fs::write(home.join("genesis.json"), serde_json::to_string_pretty(&genesis)?)?;
@@ -373,11 +1038,7 @@ impl Chain {
         let key_path = home.join("validator.key");
         let keys = if key_path.exists() {
             let seed = hex::decode(fs::read_to_string(&key_path)?.trim())?;
-            let keys = Keys::from_seed(seed.try_into().map_err(|_| anyhow!("validator.key must be 32 bytes hex"))?);
-            if !genesis.is_validator(&keys.address()) {
-                bail!("validator.key is not in this genesis' validator set");
-            }
-            Some(keys)
+            Some(Keys::from_seed(seed.try_into().map_err(|_| anyhow!("validator.key must be 32 bytes hex"))?))
         } else {
             None
         };
@@ -387,14 +1048,66 @@ impl Chain {
         let genesis_hash = hex::encode(crate::consensus::genesis_block(&genesis).digest_bytes());
         let path = home.join("blocks.jsonl");
         let log = OpenOptions::new().create(true).append(true).open(&path)?;
-        let mut chain = Chain { home: home.into(), genesis, keys, role, state, genesis_root, genesis_hash, blocks: vec![], tx_index: HashMap::new(), history: HashMap::new(), mempool: vec![], finalized_tip: 0, gossip: None, log };
-        for line in BufReader::new(File::open(&path)?).lines() {
-            let line = line?;
+        let (cblocks, cidx) = RecordFile::open(&home.join("cblocks.bin"))?;
+        let (certs, certidx) = RecordFile::open(&home.join("certs.bin"))?;
+        let mut chain = Chain {
+            home: home.into(),
+            genesis,
+            keys,
+            role,
+            state,
+            genesis_root,
+            last_hash: genesis_hash.clone(),
+            genesis_hash,
+            recent: Default::default(),
+            block_offsets: vec![],
+            block_by_hash: HashMap::new(),
+            height: 0,
+            cblocks,
+            cblock_index: vec![],
+            certs,
+            cert_index: certidx.into_iter().map(|(h, at, len)| (h, (at, len))).collect(),
+            recent_certs: BTreeMap::new(),
+            tx_index: HashMap::new(),
+            history: HashMap::new(),
+            mempool: vec![],
+            pool: HashMap::new(),
+            pending: HashMap::new(),
+            recent_failed: HashMap::new(),
+            failed_order: Default::default(),
+            finalized_tip: 0,
+            gossip: None,
+            log,
+            log_len: 0,
+        };
+        let mut offset = 0u64;
+        let mut reader = BufReader::new(File::open(&path)?);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line)?;
+            if n == 0 {
+                break;
+            }
             if line.trim().is_empty() {
+                offset += n as u64;
                 continue;
             }
             let block: Block = serde_json::from_str(&line)?;
-            chain.replay(block)?;
+            chain.replay(block, offset)?;
+            offset += n as u64;
+        }
+        chain.log_len = offset;
+        if let Some(last) = chain.recent.back() {
+            if chain.state.root() != last.state_root {
+                bail!("state root mismatch at height {} (blocks.jsonl doesn't replay)", last.height);
+            }
+        }
+        // Consensus block bytes: keep exactly one per executed height.
+        for (h, at, len) in cidx {
+            if h == chain.cblock_index.len() as u64 + 1 && h <= chain.height {
+                chain.cblock_index.push((at, len));
+            }
         }
         chain.finalized_tip = chain.height();
         Ok(chain)
@@ -405,20 +1118,89 @@ impl Chain {
         self.keys.as_ref().map(|k| k.address())
     }
 
-    /// State root after executing `height` (0 = genesis).
-    pub fn root_at(&self, height: u64) -> Option<&str> {
-        if height == 0 {
-            return Some(&self.genesis_root);
-        }
-        self.blocks.get(height as usize - 1).map(|b| b.state_root.as_str())
+    pub fn height(&self) -> u64 {
+        self.height
     }
 
     pub fn last_hash(&self) -> &str {
-        self.blocks.last().map(|b| b.hash.as_str()).unwrap_or(&self.genesis_hash)
+        &self.last_hash
     }
 
-    pub fn height(&self) -> u64 {
-        self.blocks.last().map(|b| b.height).unwrap_or(0)
+    pub fn last_block(&self) -> Option<&Block> {
+        self.recent.back()
+    }
+
+    /// Executed block at `height`, from memory or disk.
+    pub fn block(&self, height: u64) -> Option<Block> {
+        if height == 0 || height > self.height {
+            return None;
+        }
+        let first_recent = self.height + 1 - self.recent.len() as u64;
+        if height >= first_recent {
+            return self.recent.get((height - first_recent) as usize).cloned();
+        }
+        let at = *self.block_offsets.get(height as usize - 1)?;
+        use std::io::{Seek, SeekFrom};
+        let mut f = File::open(self.home.join("blocks.jsonl")).ok()?;
+        f.seek(SeekFrom::Start(at)).ok()?;
+        let mut line = String::new();
+        BufReader::new(f).read_line(&mut line).ok()?;
+        serde_json::from_str(&line).ok()
+    }
+
+    pub fn block_by_hash(&self, hash: &str) -> Option<Block> {
+        let key = u64::from_str_radix(hash.get(..16)?, 16).ok()?;
+        let b = self.block(*self.block_by_hash.get(&key)?)?;
+        (b.hash == hash).then_some(b)
+    }
+
+    /// Newest-first blocks below `before`.
+    pub fn blocks_before(&self, before: u64, limit: usize) -> Vec<Block> {
+        let top = before.saturating_sub(1).min(self.height);
+        (1..=top).rev().take(limit).filter_map(|h| self.block(h)).collect()
+    }
+
+    /// State root after executing `height` (0 = genesis).
+    pub fn root_at(&self, height: u64) -> Option<String> {
+        if height == 0 {
+            return Some(self.genesis_root.clone());
+        }
+        self.block(height).map(|b| b.state_root)
+    }
+
+    /// Exact consensus block bytes at `height`.
+    pub fn cblock(&self, height: u64) -> Option<Vec<u8>> {
+        let (at, len) = *self.cblock_index.get(height.checked_sub(1)? as usize)?;
+        self.cblocks.read(at, len)
+    }
+
+    /// Encoded finalization certificate for `height`, if stored.
+    pub fn cert(&self, height: u64) -> Option<Vec<u8>> {
+        if let Some(c) = self.recent_certs.get(&height) {
+            return Some(c.clone());
+        }
+        let (at, len) = *self.cert_index.get(&height)?;
+        self.certs.read(at, len)
+    }
+
+    pub fn cert_len(&self, height: u64) -> usize {
+        self.recent_certs.get(&height).map(|c| c.len()).or_else(|| self.cert_index.get(&height).map(|(_, l)| *l as usize)).unwrap_or(0)
+    }
+
+    /// Stores a certificate: always in the recent window, on disk at checkpoints/epoch ends.
+    pub fn store_cert(&mut self, height: u64, cert: Vec<u8>) -> Result<()> {
+        if (height % CERT_CHECKPOINT == 0 || self.state.params.is_boundary(height)) && !self.cert_index.contains_key(&height) {
+            let (at, len) = self.certs.append(height, &cert)?;
+            self.certs.sync()?;
+            self.cert_index.insert(height, (at, len));
+        }
+        self.recent_certs.insert(height, cert);
+        while self.recent_certs.len() > RECENT_CERTS {
+            let first = *self.recent_certs.keys().next().unwrap();
+            self.recent_certs.remove(&first);
+        }
+        self.finalized_tip = self.finalized_tip.max(height);
+        Ok(())
     }
 
     fn index(&mut self, block: &Block) {
@@ -439,23 +1221,64 @@ impl Chain {
         }
     }
 
-    fn replay(&mut self, block: Block) -> Result<()> {
+    fn push_block(&mut self, block: Block, offset: u64) {
+        self.block_offsets.push(offset);
+        if let Ok(key) = u64::from_str_radix(&block.hash[..16.min(block.hash.len())], 16) {
+            self.block_by_hash.insert(key, block.height);
+        }
+        self.height = block.height;
+        self.last_hash = block.hash.clone();
+        self.recent.push_back(block);
+        while self.recent.len() > RECENT_BLOCKS {
+            self.recent.pop_front();
+        }
+    }
+
+    fn replay(&mut self, block: Block, offset: u64) -> Result<()> {
         if block.height != self.height() + 1 || block.prev_hash != self.last_hash() {
             bail!("blocks.jsonl is not contiguous at height {}", block.height);
         }
-        for tx in &block.txs {
-            self.state.apply(tx, &self.genesis.chain_id, &block.proposer, block.height).with_context(|| format!("replaying block {}", block.height))?;
+        for (i, tx) in block.txs.iter().enumerate() {
+            let outcome = self.state.apply(tx, &self.genesis.chain_id, &block.proposer, block.height).with_context(|| format!("replaying block {}", block.height))?;
+            let expected = match block.failed.get(&i) {
+                Some(r) => Outcome::Failed(r.clone()),
+                None => Outcome::Applied,
+            };
+            if outcome != expected {
+                bail!("replaying block {}: tx {i} gave {outcome:?}, recorded {expected:?}", block.height);
+            }
         }
-        if self.state.root() != block.state_root {
+        if self.state.params.is_boundary(block.height) {
+            self.state.end_epoch(self.state.params.epoch_of(block.height));
+        }
+        // The root is O(state) to compute, so replay checks it periodically (and at the end).
+        if block.height % REPLAY_ROOT_CHECK == 0 && self.state.root() != block.state_root {
             bail!("state root mismatch at height {}", block.height);
         }
         self.index(&block);
-        self.blocks.push(block);
+        self.push_block(block, offset);
         Ok(())
     }
 
-    /// Executes a finalized block: applies its txs in order, skipping invalid ones (exactly like
-    /// the old single-proposer loop), appends it durably to `blocks.jsonl`, then prunes the mempool.
+    fn note_failed(&mut self, id: String, reason: String, height: u64) {
+        if self.recent_failed.insert(id.clone(), (reason, height)).is_none() {
+            self.failed_order.push_back(id);
+        }
+        while self.failed_order.len() > RECENT_FAILED {
+            if let Some(old) = self.failed_order.pop_front() {
+                self.recent_failed.remove(&old);
+            }
+        }
+    }
+
+    /// Why a tx failed or was dropped, if we remember.
+    pub fn failure(&self, id: &str) -> Option<&(String, u64)> {
+        self.recent_failed.get(id)
+    }
+
+    /// Executes a finalized block: applies its txs in order (invalid ones are skipped; ones whose
+    /// action fails are charged their fee), appends it durably to `blocks.jsonl`, then prunes the
+    /// mempool.
     pub fn execute(&mut self, f: Finalized) -> Result<()> {
         if f.height != self.height() + 1 {
             bail!("expected block {}, got {}", self.height() + 1, f.height);
@@ -464,55 +1287,145 @@ impl Chain {
             bail!("block {} does not extend our chain", f.height);
         }
         let mut txs = vec![];
+        let mut failed = BTreeMap::new();
         for tx in f.txs {
-            if self.state.apply(&tx, &self.genesis.chain_id, &f.proposer, f.height).is_ok() {
-                txs.push(tx);
+            match self.state.apply(&tx, &self.genesis.chain_id, &f.proposer, f.height) {
+                Ok(Outcome::Applied) => txs.push(tx),
+                Ok(Outcome::Failed(r)) => {
+                    failed.insert(txs.len(), r.clone());
+                    self.note_failed(tx.id(), r, f.height);
+                    txs.push(tx);
+                }
+                Err(e) => self.note_failed(tx.id(), format!("not included: {e}"), f.height),
             }
         }
-        let block = Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, proposer: f.proposer, state_root: self.state.root(), txs, hash: f.hash, signature: f.certificate };
-        writeln!(self.log, "{}", serde_json::to_string(&block)?)?;
+        if self.state.params.is_boundary(f.height) {
+            self.state.end_epoch(self.state.params.epoch_of(f.height));
+        }
+        let block = Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, proposer: f.proposer, state_root: self.state.root(), txs, hash: f.hash, signature: String::new(), failed };
+        let (at, len) = self.cblocks.append(f.height, &f.cblock)?;
+        self.cblock_index.push((at, len));
+        let line = serde_json::to_string(&block)? + "\n";
+        self.log.write_all(line.as_bytes())?;
+        self.cblocks.sync()?;
         self.log.sync_data()?;
+        let offset = self.log_len;
+        self.log_len += line.len() as u64;
         self.index(&block);
-        self.blocks.push(block);
+        self.push_block(block, offset);
+        if let Some(cert) = f.certificate {
+            self.store_cert(f.height, cert)?;
+        }
         self.finalized_tip = self.finalized_tip.max(f.height);
         self.revalidate_mempool();
         Ok(())
-    }
-
-    /// Drops mempool txs that were included or can no longer apply (bad nonce, spent balance…).
-    fn revalidate_mempool(&mut self) {
-        let mut scratch = self.state.clone();
-        let next = self.height() + 1;
-        let proposer = self.fee_sink();
-        let chain_id = self.genesis.chain_id.clone();
-        let tx_index = &self.tx_index;
-        self.mempool.retain(|tx| !tx_index.contains_key(&tx.id()) && scratch.apply(tx, &chain_id, &proposer, next).is_ok());
     }
 
     fn fee_sink(&self) -> String {
         self.me().unwrap_or_else(|| self.genesis.validators[0].address.clone())
     }
 
-    /// Checks a tx against current state plus whatever is already queued, then queues it.
-    /// Returns the id and whether it was new (already-known txs are accepted idempotently).
-    pub fn submit_tx(&mut self, tx: Tx) -> Result<(String, bool)> {
-        let id = tx.id();
-        if self.tx_index.contains_key(&id) || self.mempool.iter().any(|t| t.id() == id) {
-            return Ok((id, false));
+    fn rebuild_pending(&mut self) {
+        self.pending.clear();
+        for tx in &self.mempool {
+            let e = self.pending.entry(tx.from.clone()).or_default();
+            e.0 += 1;
+            e.1 = e.1.saturating_add(State::tx_debit(tx));
         }
-        let mut scratch = self.state.clone();
+    }
+
+    /// Drops mempool txs that were included, expired, or can no longer apply. Uses a journal
+    /// over the live state (rolled back afterwards) instead of cloning it.
+    fn revalidate_mempool(&mut self) {
         let next = self.height() + 1;
         let proposer = self.fee_sink();
-        for queued in &self.mempool {
-            let _ = scratch.apply(queued, &self.genesis.chain_id, &proposer, next);
+        let chain_id = self.genesis.chain_id.clone();
+        let mut j = Journal::default();
+        let mut keep = Vec::with_capacity(self.mempool.len());
+        let mut dropped = vec![];
+        for tx in std::mem::take(&mut self.mempool) {
+            let id = tx.id();
+            if self.tx_index.contains_key(&id) {
+                self.pool.remove(&id);
+                continue;
+            }
+            let added = self.pool.get(&id).map(|e| e.added_at).unwrap_or(next);
+            if added + MEMPOOL_TTL_BLOCKS < next {
+                dropped.push((id, format!("expired: not included within {MEMPOOL_TTL_BLOCKS} blocks")));
+                continue;
+            }
+            match self.state.apply_j(&mut j, &tx, &chain_id, &proposer, next, false) {
+                Ok(Outcome::Applied) => keep.push(tx),
+                Ok(Outcome::Failed(r)) => dropped.push((id, format!("dropped from the mempool: {r}"))),
+                Err(e) => dropped.push((id, format!("dropped from the mempool: {e}"))),
+            }
         }
-        scratch.apply(&tx, &self.genesis.chain_id, &proposer, next)?;
+        self.state.rollback(j);
+        self.mempool = keep;
+        for (id, r) in dropped {
+            self.pool.remove(&id);
+            self.note_failed(id, r, next);
+        }
+        self.rebuild_pending();
+    }
+
+    /// Checks a tx against current state plus what the sender already has queued, then queues
+    /// it. The caller must have verified the signature (outside the chain lock). Cost doesn't
+    /// grow with the mempool: pending nonces and balance reservations are cached per sender.
+    /// Returns the id and whether it was new (already-known txs are accepted idempotently).
+    pub fn submit_tx(&mut self, tx: Tx) -> Result<(String, bool)> {
+        tx.check_format()?;
+        let id = tx.id();
+        if self.tx_index.contains_key(&id) || self.pool.contains_key(&id) {
+            return Ok((id, false));
+        }
+        let sender = tx.sender()?;
+        let (count, reserved) = self.pending.get(&sender).copied().unwrap_or_default();
+        if count >= MAX_PENDING_PER_SENDER {
+            bail!("too many pending transactions from {}; wait for some to finalize", short(&sender));
+        }
+        let expected = self.state.account(&sender).nonce + count as u64;
+        if tx.nonce != expected {
+            bail!("bad nonce: expected {expected}, got {}", tx.nonce);
+        }
+        let next = self.height() + 1;
+        let proposer = self.fee_sink();
+        let chain_id = self.genesis.chain_id.clone();
+        // Dry run on the live state as if the sender's queued txs had already gone through.
+        let mut j = Journal::default();
+        let result = (|| -> Result<Outcome> {
+            if count > 0 {
+                self.state.j_debit(&mut j, &sender, reserved).map_err(|_| anyhow!("insufficient balance once your pending transactions go through"))?;
+                self.state.acct_mut(&mut j, &sender).nonce = tx.nonce;
+            }
+            self.state.apply_j(&mut j, &tx, &chain_id, &proposer, next, false)
+        })();
+        self.state.rollback(j);
+        match result? {
+            Outcome::Applied => {}
+            Outcome::Failed(r) => bail!(r),
+        }
         if self.mempool.len() >= MAX_MEMPOOL {
-            bail!("mempool is full, try again in a few seconds");
+            // Full: evict the lowest fee-per-byte tx if this one pays more, else refuse.
+            let rate = |t: &Tx| t.fee as f64 / t.size().max(1) as f64;
+            let (idx, lowest) = self.mempool.iter().enumerate().min_by(|a, b| rate(a.1).total_cmp(&rate(b.1))).map(|(i, t)| (i, rate(t))).unwrap();
+            if rate(&tx) <= lowest {
+                bail!("mempool is full; raise your fee above {:.1} drops/byte or try again shortly", lowest);
+            }
+            let evicted = self.mempool.remove(idx);
+            let eid = evicted.id();
+            self.pool.remove(&eid);
+            self.note_failed(eid, "evicted from a full mempool by a higher-fee transaction".into(), next);
+            self.rebuild_pending();
         }
         if let Some(g) = &self.gossip {
             let _ = g.unbounded_send(tx.clone());
         }
+        let debit = State::tx_debit(&tx);
+        let e = self.pending.entry(sender.clone()).or_default();
+        e.0 += 1;
+        e.1 = e.1.saturating_add(debit);
+        self.pool.insert(id.clone(), PoolEntry { added_at: next });
         self.mempool.push(tx);
         Ok((id, true))
     }
@@ -522,16 +1435,48 @@ impl Chain {
     }
 
     /// Adds a tx that another node already accepted (full nodes track what they forwarded).
-    pub fn track_pending(&mut self, tx: Tx) {
+    pub fn track_pending(&mut self, tx: Tx) -> Result<()> {
+        tx.check_format()?;
         let id = tx.id();
-        if !self.tx_index.contains_key(&id) && !self.mempool.iter().any(|t| t.id() == id) {
+        if !self.tx_index.contains_key(&id) && !self.pool.contains_key(&id) {
+            let sender = tx.sender()?;
+            if self.pending.get(&sender).is_some_and(|p| p.0 >= MAX_PENDING_PER_SENDER) || self.mempool.len() >= MAX_MEMPOOL {
+                return Ok(());
+            }
+            let debit = State::tx_debit(&tx);
+            let e = self.pending.entry(sender.clone()).or_default();
+            e.0 += 1;
+            e.1 = e.1.saturating_add(debit);
+            self.pool.insert(id, PoolEntry { added_at: self.height() + 1 });
             self.mempool.push(tx);
         }
+        Ok(())
+    }
+
+    /// Removes a tx we queued locally (e.g. a full node whose forward failed).
+    pub fn drop_pending(&mut self, id: &str) {
+        if self.pool.remove(id).is_some() {
+            self.mempool.retain(|t| t.id() != id);
+            self.rebuild_pending();
+        }
+    }
+
+    pub fn pending_count(&self, addr: &str) -> usize {
+        self.pending.get(addr).map(|p| p.0).unwrap_or(0)
+    }
+
+    pub fn in_mempool(&self, id: &str) -> bool {
+        self.pool.contains_key(id)
     }
 
     /// Next nonce for an address, counting txs already waiting in the mempool.
     pub fn next_nonce(&self, addr: &str) -> u64 {
-        self.state.account(addr).nonce + self.mempool.iter().filter(|t| t.sender().ok().as_deref() == Some(addr)).count() as u64
+        self.state.account(addr).nonce + self.pending_count(addr) as u64
+    }
+
+    /// Whether the faucet can take another drip right now.
+    pub fn faucet_busy(&self) -> bool {
+        self.me().is_some_and(|me| self.pending_count(&me) >= FAUCET_MAX_PENDING)
     }
 
     /// Testnet faucet: the validator's own genesis-funded account pays. Full nodes forward the
@@ -539,6 +1484,9 @@ impl Chain {
     pub fn faucet(&mut self, to: &str, amount: u64) -> Result<Tx> {
         if !self.genesis.faucet {
             bail!("this chain has no faucet");
+        }
+        if self.faucet_busy() {
+            bail!("faucet busy, retry in a few seconds");
         }
         let keys = self.keys.as_ref().ok_or_else(|| anyhow!("this node has no faucet key"))?;
         let to = self.state.resolve(to)?;
@@ -562,12 +1510,19 @@ impl Chain {
     /// Test helper: execute the mempool as the next block (what a lone validator would finalize).
     #[cfg(test)]
     pub fn produce_block(&mut self) -> Result<()> {
-        let f = Finalized { height: self.height() + 1, hash: hex::encode(crypto::hash(format!("test-{}", self.height()).as_bytes())), parent: self.last_hash().to_string(), timestamp_ms: now_ms(), proposer: self.fee_sink(), txs: self.mempool.clone(), certificate: String::new() };
+        let txs = self.mempool.clone();
+        self.produce_block_with(txs)
+    }
+
+    #[cfg(test)]
+    pub fn produce_block_with(&mut self, txs: Vec<Tx>) -> Result<()> {
+        let f = Finalized { height: self.height() + 1, hash: hex::encode(crypto::hash(format!("test-{}-{}", self.height(), self.last_hash()).as_bytes())), parent: self.last_hash().to_string(), timestamp_ms: now_ms(), proposer: self.fee_sink(), txs, cblock: vec![], certificate: None };
         self.execute(f)
     }
 }
 
 pub const MAX_MEMPOOL: usize = 5_000;
+pub const MAX_PENDING_PER_SENDER: usize = 64;
 
 #[cfg(test)]
 mod tests {
@@ -576,7 +1531,7 @@ mod tests {
     #[test]
     fn transfer_and_names_survive_restart() {
         let home = std::env::temp_dir().join(format!("blockula-test-{}", now_ms()));
-        Chain::summon(&home, "test-1", true, 1000, 1, None).unwrap();
+        Chain::summon(&home, &SummonOpts::new("test-1", 1)).unwrap();
         let alice = Keys::from_seed([1u8; 32]);
         {
             let mut c = Chain::open(&home).unwrap();
@@ -604,7 +1559,7 @@ mod tests {
     #[test]
     fn owner_and_session_keys() {
         let home = std::env::temp_dir().join(format!("blockula-aa-{}", now_ms()));
-        Chain::summon(&home, "test-aa", true, 1000, 1, None).unwrap();
+        Chain::summon(&home, &SummonOpts::new("test-aa", 1)).unwrap();
         let mut c = Chain::open(&home).unwrap();
         let (owner, laptop, agent) = (Keys::from_seed([1u8; 32]), Keys::from_seed([2u8; 32]), Keys::from_seed([3u8; 32]));
         let acct = owner.address();
@@ -643,5 +1598,247 @@ mod tests {
         drop(c);
         assert_eq!(Chain::open(&home).unwrap().state.root(), root);
         fs::remove_dir_all(home).ok();
+    }
+}
+
+/// Regression tests for the security audit (PoCs from audit-core, now asserting the fixes).
+#[cfg(test)]
+mod audit {
+    use super::*;
+    use std::time::Instant;
+
+    fn fresh(tag: &str) -> (PathBuf, Chain) {
+        let home = std::env::temp_dir().join(format!("blockula-audit-{tag}-{}-{}", now_ms(), std::process::id()));
+        Chain::summon(&home, &SummonOpts::new("audit", 1)).unwrap();
+        let c = Chain::open(&home).unwrap();
+        (home, c)
+    }
+
+    fn signed_fee(c: &Chain, from: &str, keys: &Keys, nonce: u64, action: Action, fee: Option<u64>) -> Tx {
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), from: from.into(), nonce, fee: 0, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        tx.fee = fee.unwrap_or_else(|| min_fee(tx.size()));
+        tx.sign(keys)
+    }
+
+    /// Unsigned (zero signature) tx: the state machine doesn't verify signatures (admission and
+    /// block verification do), so benchmarks can skip ML-DSA signing.
+    fn unsigned(chain_id: &str, from: &Keys, nonce: u64, action: Action) -> Tx {
+        let mut tx = Tx { chain_id: chain_id.into(), from: from.address(), nonce, fee: 0, action, memo: String::new(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        tx.fee = min_fee(tx.size());
+        tx
+    }
+
+    #[test]
+    fn oversized_tx_rejected_and_stale_txs_expire() {
+        let (_h, mut c) = fresh("big");
+        let a = Keys::from_seed([5u8; 32]);
+        c.faucet(&a.address(), 50 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        c.submit(signed_fee(&c, &a.address(), &a, 0, Action::RegisterName { name: "victim".into() }, None)).unwrap();
+        c.produce_block().unwrap();
+        // The old PoC: `to` padded with 60 KB of spaces used to be trimmed and accepted.
+        let pad = format!("victim.boo{}", " ".repeat(60_000));
+        let big = signed_fee(&c, &a.address(), &a, 1, Action::Transfer { to: pad, amount: 1 }, Some(100 * 66_000));
+        assert!(serde_json::to_vec(&big).unwrap().len() > MAX_TX_BYTES);
+        let err = c.submit(big.clone()).unwrap_err().to_string();
+        assert!(err.contains("too large"), "{err}");
+        assert!(c.track_pending(big).is_err());
+        assert!(c.mempool.is_empty());
+        // Field caps.
+        let long_label = Action::AddKey { key_id: "ab".repeat(32), label: "x".repeat(65), role: KeyRole::Owner };
+        assert!(c.submit(signed_fee(&c, &a.address(), &a, 1, long_label, None)).unwrap_err().to_string().contains("label too long"));
+        let mut memo = signed_fee(&c, &a.address(), &a, 1, Action::Transfer { to: c.me().unwrap(), amount: 1 }, None);
+        memo.memo = "m".repeat(257);
+        assert!(c.submit(memo.sign(&a)).is_err());
+        // A tx that can never be included expires instead of sitting in the mempool forever.
+        let later = signed_fee(&c, &a.address(), &a, 1, Action::Transfer { to: c.me().unwrap(), amount: 1 }, None);
+        let id = c.submit(later).unwrap();
+        for _ in 0..=MEMPOOL_TTL_BLOCKS {
+            c.produce_block_with(vec![]).unwrap();
+        }
+        assert!(c.mempool.is_empty());
+        assert!(c.failure(&id).unwrap().0.contains("expired"));
+    }
+
+    #[test]
+    fn tx_id_not_malleable_via_hex_case() {
+        let (_h, mut c) = fresh("mall");
+        let a = Keys::from_seed([3u8; 32]);
+        c.faucet(&a.address(), 50 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let tx = signed_fee(&c, &a.address(), &a, 0, Action::Transfer { to: c.me().unwrap(), amount: 1 }, None);
+        let orig_id = tx.id();
+        let mut m = tx.clone();
+        m.signature = m.signature.to_uppercase();
+        assert_eq!(m.id(), orig_id, "id is over the decoded signature bytes");
+        assert!(crate::consensus::check_tx_stateless(&m, "audit").is_err(), "uppercase hex is rejected");
+        assert!(c.submit(m).is_err());
+        c.submit(tx).unwrap();
+        c.produce_block().unwrap();
+        assert!(c.tx_index.contains_key(&orig_id));
+    }
+
+    #[test]
+    fn uppercase_key_id_rejected() {
+        let (_h, mut c) = fresh("kid");
+        let (orig, dev) = (Keys::from_seed([1u8; 32]), Keys::from_seed([2u8; 32]));
+        let acct = orig.address();
+        c.faucet(&acct, 50 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let upper = Action::AddKey { key_id: key_id(&dev.public_key()).to_uppercase(), label: "phone".into(), role: KeyRole::Owner };
+        assert!(c.submit(signed_fee(&c, &acct, &orig, 0, upper.clone(), None)).unwrap_err().to_string().contains("lowercase"));
+        // Even if one got into a block, execution rejects it (no bricked account).
+        let tx = signed_fee(&c, &acct, &orig, 0, upper, None);
+        c.produce_block_with(vec![tx]).unwrap();
+        assert_eq!(c.state.keys_of(&acct).len(), 1);
+    }
+
+    #[test]
+    fn uppercase_address_alias_rejected() {
+        let (_h, mut c) = fresh("case");
+        let orig = Keys::from_seed([1u8; 32]);
+        let upper = orig.address().to_uppercase();
+        assert!(!crypto::is_address(&upper));
+        c.faucet(&orig.address(), 50 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let to_upper = signed_fee(&c, &orig.address(), &orig, 0, Action::Transfer { to: upper.clone(), amount: DROPS_PER_FANG }, None);
+        assert!(c.submit(to_upper).is_err());
+        let mut from_upper = signed_fee(&c, &orig.address(), &orig, 0, Action::Transfer { to: c.me().unwrap(), amount: 1 }, None);
+        from_upper.from = upper;
+        assert!(c.submit(from_upper.sign(&orig)).is_err());
+    }
+
+    #[test]
+    fn register_validator_requires_proof_of_possession() {
+        let (_h, mut c) = fresh("squat");
+        let (attacker, victim) = (Keys::from_seed([4u8; 32]), Keys::from_seed([6u8; 32]));
+        c.faucet(&attacker.address(), 100 * DROPS_PER_FANG).unwrap();
+        c.faucet(&victim.address(), 100 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let reg = |owner: &str, signer_seed: [u8; 32], p2p: &str| Action::RegisterValidator {
+            consensus_key: hex::encode(victim.public_key()),
+            p2p_addr: p2p.into(),
+            http_addr: "1.2.3.4:1".into(),
+            bond: 50 * DROPS_PER_FANG,
+            pop: make_pop(signer_seed, "audit", owner, p2p, "1.2.3.4:1"),
+        };
+        // Attacker can't produce a PoP for the victim's key.
+        let squat = reg(&attacker.address(), [4u8; 32], "6.6.6.6:1");
+        let err = c.submit(signed_fee(&c, &attacker.address(), &attacker, 0, squat, None)).unwrap_err().to_string();
+        assert!(err.contains("pop"), "{err}");
+        // Nor replay the victim's PoP for its own registration (it binds the owner).
+        let stolen = reg(&victim.address(), [6u8; 32], "1.2.3.4:2");
+        assert!(c.submit(signed_fee(&c, &attacker.address(), &attacker, 0, stolen.clone(), None)).is_err());
+        c.submit(signed_fee(&c, &victim.address(), &victim, 0, stolen, None)).unwrap();
+        c.produce_block().unwrap();
+        assert_eq!(c.state.validators[&victim.address()].p2p_addr, "1.2.3.4:2");
+    }
+
+    #[test]
+    fn failed_txs_pay_their_fee_and_report_status() {
+        let (home, mut c) = fresh("fail");
+        let a = Keys::from_seed([8u8; 32]);
+        c.faucet(&a.address(), 10 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        // Two transfers that each fit alone but not together: the second fails at execution.
+        let t1 = signed_fee(&c, &a.address(), &a, 0, Action::Transfer { to: c.me().unwrap(), amount: 6 * DROPS_PER_FANG }, None);
+        let t2 = signed_fee(&c, &a.address(), &a, 1, Action::Transfer { to: c.me().unwrap(), amount: 6 * DROPS_PER_FANG }, None);
+        let fees = t1.fee + t2.fee;
+        c.produce_block_with(vec![t1, t2.clone()]).unwrap();
+        let acct = c.state.account(&a.address());
+        assert_eq!(acct.nonce, 2, "failed tx used its nonce");
+        assert_eq!(acct.balance, 10 * DROPS_PER_FANG - 6 * DROPS_PER_FANG - fees, "failed tx paid its fee");
+        assert!(c.failure(&t2.id()).unwrap().0.contains("insufficient"));
+        let (h, i) = c.tx_index[&t2.id()];
+        assert!(c.block(h).unwrap().failed.contains_key(&i));
+        // New accounts need a minimum transfer.
+        let dust = signed_fee(&c, &a.address(), &a, 2, Action::Transfer { to: Keys::from_seed([77; 32]).address(), amount: 1 }, None);
+        assert!(c.submit(dust).unwrap_err().to_string().contains("new account"));
+        // Replays identically.
+        let root = c.state.root();
+        drop(c);
+        assert_eq!(Chain::open(&home).unwrap().state.root(), root);
+    }
+
+    #[test]
+    fn session_key_bounds_and_names() {
+        let (_h, mut c) = fresh("sess");
+        let (o, s) = (Keys::from_seed([1u8; 32]), Keys::from_seed([2u8; 32]));
+        c.faucet(&o.address(), 50 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+        let zero = Action::AddKey { key_id: key_id(&s.public_key()), label: "a".into(), role: KeyRole::Session { limit: 1, period_blocks: 0, expires_at: 10 } };
+        assert!(c.submit(signed_fee(&c, &o.address(), &o, 0, zero, None)).is_err());
+        let forever = Action::AddKey { key_id: key_id(&s.public_key()), label: "a".into(), role: KeyRole::Session { limit: 1, period_blocks: 1, expires_at: u64::MAX } };
+        assert!(c.submit(signed_fee(&c, &o.address(), &o, 0, forever, None)).unwrap_err().to_string().contains("at most"));
+        assert!(normalize_name("\u{212A}im").is_err(), "Kelvin sign doesn't fold to k");
+        assert!(normalize_name(" jack").is_err());
+        assert!(normalize_name("jack ").is_err());
+        assert_eq!(normalize_name("Jack.boo").unwrap(), "jack");
+    }
+
+    #[test]
+    fn faucet_has_a_global_budget() {
+        let (_h, mut c) = fresh("budget");
+        for i in 0..FAUCET_MAX_PENDING as u8 {
+            c.faucet(&Keys::from_seed([200u8.wrapping_add(i); 32]).address(), DROPS_PER_FANG).unwrap();
+        }
+        assert!(c.faucet_busy());
+        assert!(c.faucet(&Keys::from_seed([1; 32]).address(), DROPS_PER_FANG).unwrap_err().to_string().contains("faucet busy"));
+        c.produce_block().unwrap();
+        assert!(!c.faucet_busy());
+    }
+
+    /// 5,000 queued txs: admitting one more must not re-apply the whole mempool.
+    #[test]
+    fn mempool_admission_stays_fast_when_full() {
+        let (_h, mut c) = fresh("mp");
+        let senders: Vec<Keys> = (0..79u32).map(|i| Keys::from_seed(crypto::hash(&i.to_le_bytes()))).collect();
+        for k in &senders {
+            c.state.accounts.insert(k.address(), Account { balance: 1_000 * DROPS_PER_FANG, ..Default::default() });
+        }
+        let me = c.me().unwrap();
+        let t = Instant::now();
+        'fill: for k in &senders {
+            for n in 0..MAX_PENDING_PER_SENDER as u64 {
+                if c.mempool.len() >= MAX_MEMPOOL {
+                    break 'fill;
+                }
+                c.submit(unsigned("audit", k, n, Action::Transfer { to: me.clone(), amount: 1 })).unwrap();
+            }
+        }
+        let fill = t.elapsed();
+        assert_eq!(c.mempool.len(), MAX_MEMPOOL);
+        let x = Keys::from_seed([77u8; 32]);
+        c.state.accounts.insert(x.address(), Account { balance: 100 * DROPS_PER_FANG, ..Default::default() });
+        let mut tx = unsigned("audit", &x, 0, Action::Transfer { to: me.clone(), amount: 1 });
+        tx.fee *= 2; // outbids the cheapest, so it evicts one
+        let t = Instant::now();
+        c.submit(tx).unwrap();
+        let one = t.elapsed();
+        println!("filled 5,000-tx mempool in {fill:?}; one more submit (with eviction) took {one:?}");
+        assert!(one.as_millis() < 250, "submit took {one:?}");
+        let t = Instant::now();
+        c.revalidate_mempool();
+        println!("revalidating 5,000 txs: {:?}", t.elapsed());
+    }
+
+    /// 200k accounts and a full 512-tx block: no per-tx state clone.
+    #[test]
+    fn big_state_block_execution() {
+        let (_h, mut c) = fresh("clone");
+        for i in 0..200_000u64 {
+            c.state.accounts.insert(crypto::address_from_bytes(&crypto::hash(&i.to_le_bytes())), Account { balance: DROPS_PER_FANG, ..Default::default() });
+        }
+        let senders: Vec<Keys> = (0..8u32).map(|i| Keys::from_seed(crypto::hash(&(i + 1000).to_le_bytes()))).collect();
+        for k in &senders {
+            c.state.accounts.insert(k.address(), Account { balance: 1_000 * DROPS_PER_FANG, ..Default::default() });
+        }
+        let txs: Vec<Tx> = (0..512u64).map(|i| unsigned("audit", &senders[(i % 8) as usize], i / 8, Action::Transfer { to: crypto::address_from_bytes(&crypto::hash(&i.to_le_bytes())), amount: 1 })).collect();
+        let t = Instant::now();
+        c.produce_block_with(txs).unwrap();
+        let took = t.elapsed();
+        println!("512-tx block over 200k accounts executed in {took:?}");
+        assert_eq!(c.block(c.height()).unwrap().txs.len(), 512);
+        assert!(took.as_secs_f64() < if cfg!(debug_assertions) { 10.0 } else { 1.0 }, "{took:?}");
     }
 }

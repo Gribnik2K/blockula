@@ -9,27 +9,29 @@ use anyhow::{anyhow, bail, Context, Result};
 use commonware_codec::{Decode, DecodeExt};
 use commonware_consensus::simplex::types::Finalization;
 use commonware_cryptography::{Digestible, blake3::Digest, certificate::Verifier as _};
-use commonware_p2p::{Manager as _, authenticated::discovery};
+use commonware_p2p::authenticated::discovery;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio as cw_tokio};
 use commonware_utils::NZUsize;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-async fn serve_http(node: Node, port: u16) {
+async fn serve_http(node: Node, bind: SocketAddr) {
     let home = node.chain.lock().home.clone();
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+    let listener = match tokio::net::TcpListener::bind(bind).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("❌ couldn't bind http port {port}: {e}");
+            eprintln!("❌ couldn't bind http {bind}: {e}");
             std::process::exit(1);
         }
     };
-    println!("🦇 Explorer:  http://localhost:{port}\n🔌 API:       http://localhost:{port}/api/status\n📁 Data:      {}", home.display());
-    if let Err(e) = axum::serve(listener, api::router(node)).await {
+    let port = bind.port();
+    println!("🦇 Explorer:  http://localhost:{port}\n🔌 API:       http://localhost:{port}/api/status   (bound to {bind})\n📁 Data:      {}", home.display());
+    if let Err(e) = axum::serve(listener, api::router(node).into_make_service_with_connect_info::<SocketAddr>()).await {
         eprintln!("http server failed: {e}");
     }
 }
@@ -38,58 +40,222 @@ fn port_of(addr: &str) -> Option<u16> {
     addr.rsplit(':').next()?.parse().ok()
 }
 
-pub fn run_validator(home: PathBuf, port: Option<u16>) -> Result<()> {
+/// Where and how a node listens. `bind` is the local interface (127.0.0.1, 0.0.0.0, ::);
+/// the advertised addresses (genesis or node.json) are what peers dial.
+#[derive(Clone, Debug)]
+pub struct NetOpts {
+    pub bind: String,
+    pub http_port: Option<u16>,
+    /// `local` allows private/loopback peer addresses; `recommended` is for public networks.
+    /// Default: `local` when our advertised p2p host is private, else `recommended`.
+    pub p2p_preset: Option<String>,
+    /// Single-validator dev chains listen for p2p on an OS-picked port.
+    pub ephemeral_p2p: bool,
+    /// How HTTP rate limits identify callers (proxy headers, trusted forwarders).
+    pub client_ip: crate::api::ClientIpPolicy,
+    /// `--peer-http`: replaces the genesis http_addr list for sync and forwarding.
+    pub peer_http: Vec<String>,
+    /// `--i-know-this-key-is-not-running-elsewhere`: skip the double-signing guards.
+    pub force_key: bool,
+}
+
+/// The HTTP peers a node syncs from and forwards to: `--peer-http` if given, otherwise the
+/// genesis validators' http addresses (minus our own).
+pub fn http_peers(genesis: &Genesis, override_: &[String], me: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    let list: Vec<String> = if override_.is_empty() {
+        genesis.validators.iter().filter(|v| Some(v.address.as_str()) != me).map(|v| crate::chain::http_url(&v.http_addr)).collect()
+    } else {
+        override_.iter().map(|u| crate::chain::http_url(u)).collect()
+    };
+    for u in list {
+        if !out.contains(&u) {
+            out.push(u);
+        }
+    }
+    out
+}
+
+pub fn socket(bind: &str, port: u16) -> Result<SocketAddr> {
+    let host = bind.trim_start_matches('[').trim_end_matches(']');
+    let ip: std::net::IpAddr = host.parse().with_context(|| format!("--bind must be an IP address, got {bind}"))?;
+    Ok(SocketAddr::new(ip, port))
+}
+
+/// Parses an advertised `host:port` (IP or DNS name) into a dialable ingress.
+pub fn ingress(addr: &str) -> Result<commonware_p2p::Ingress> {
+    if let Ok(sa) = addr.parse::<SocketAddr>() {
+        return Ok(sa.into());
+    }
+    let (host, port) = addr.rsplit_once(':').ok_or_else(|| anyhow!("expected host:port, got {addr}"))?;
+    let host = commonware_utils::Hostname::new(host.to_string()).map_err(|e| anyhow!("bad hostname {host}: {e:?}"))?;
+    Ok(commonware_p2p::Ingress::Dns { host, port: port.parse()? })
+}
+
+fn is_private_host(addr: &str) -> bool {
+    match addr.parse::<SocketAddr>() {
+        Ok(sa) => match sa.ip() {
+            std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified(),
+            std::net::IpAddr::V6(ip) => ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00,
+        },
+        Err(_) => addr.starts_with("localhost:"),
+    }
+}
+
+/// A validator's own advertised addresses: from genesis, or node.json for validators that
+/// joined later (`blockula validator init`).
+#[derive(Serialize, Deserialize, Clone)]
+pub struct NodeAddrs {
+    pub p2p_addr: String,
+    pub http_addr: String,
+}
+
+/// Refuses to start a validator that may already be signing somewhere else: a key with a
+/// chain history but no consensus journal (restored/copied home), or a home last used by a
+/// different machine (`machine.lock` vs `BLOCKULA_INSTANCE_ID` / `FLY_MACHINE_ID`).
+pub fn double_sign_guard(home: &Path, height: u64, force: bool) -> Result<()> {
+    let instance = std::env::var("BLOCKULA_INSTANCE_ID").ok().or_else(|| std::env::var("FLY_MACHINE_ID").ok()).filter(|s| !s.is_empty());
+    double_sign_guard_with(home, height, force, instance)
+}
+
+pub fn double_sign_guard_with(home: &Path, height: u64, force: bool, instance: Option<String>) -> Result<()> {
+    let journal = home.join("consensus");
+    let journal_empty = std::fs::read_dir(&journal).map(|mut d| d.next().is_none()).unwrap_or(true);
+    if height > 0 && journal_empty && !force {
+        bail!(
+            "refusing to start: this home has {height} executed blocks but no consensus journal ({}). If this validator.key is running anywhere else, starting here could double-sign. Pass --i-know-this-key-is-not-running-elsewhere once you're sure.",
+            journal.display()
+        );
+    }
+    if let Some(id) = instance {
+        let lock = home.join("machine.lock");
+        match std::fs::read_to_string(&lock) {
+            Ok(prev) if prev.trim() != id && !force => bail!(
+                "refusing to start: {} says this validator home belongs to instance `{}`, but this is `{id}`. Running one key on two machines double-signs. Pass --i-know-this-key-is-not-running-elsewhere after stopping the other one.",
+                lock.display(),
+                prev.trim()
+            ),
+            Ok(prev) if prev.trim() == id => {}
+            _ => std::fs::write(&lock, &id)?,
+        }
+    }
+    Ok(())
+}
+
+/// Consensus storage written by an older layout can't be read; say so instead of crashing.
+pub fn check_storage_version(home: &Path) -> Result<()> {
+    let marker = home.join("consensus.version");
+    let dir = home.join("consensus");
+    let nonempty = std::fs::read_dir(&dir).map(|mut d| d.next().is_some()).unwrap_or(false);
+    match std::fs::read_to_string(&marker) {
+        Ok(v) if v.trim() == consensus::STORAGE_VERSION => Ok(()),
+        _ if nonempty => bail!(
+            "{} was written by an older Blockula. Re-summon the chain, or (single validator) delete it and start with --i-know-this-key-is-not-running-elsewhere to rebuild it.",
+            dir.display()
+        ),
+        _ => Ok(std::fs::write(&marker, consensus::STORAGE_VERSION)?),
+    }
+}
+
+/// Dev chains made by an older Blockula are reset automatically.
+pub fn dev_is_stale(home: &Path) -> bool {
+    let nonempty = std::fs::read_dir(home.join("consensus")).map(|mut d| d.next().is_some()).unwrap_or(false);
+    nonempty && std::fs::read_to_string(home.join("consensus.version")).map(|v| v.trim() != consensus::STORAGE_VERSION).unwrap_or(true)
+}
+
+pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     let chain = Chain::open(&home)?;
+    double_sign_guard(&home, chain.height(), net.force_key)?;
+    check_storage_version(&home)?;
     let genesis = chain.genesis.clone();
     let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key"))?.trim())?.try_into().map_err(|_| anyhow!("bad validator.key"))?;
     let key = PrivateKey::from_seed_bytes(seed);
-    let me = chain.me().unwrap();
-    let info = genesis.validators.iter().find(|v| v.address == me).cloned().ok_or_else(|| anyhow!("not a validator"))?;
-    let http_port = port.or_else(|| port_of(&info.http_addr)).unwrap_or(7070);
-    let participants = consensus::participants(&genesis)?;
-    let solo = genesis.validators.len() == 1;
-    let listen: SocketAddr = if solo { "127.0.0.1:0".parse()? } else { info.p2p_addr.parse().with_context(|| format!("bad p2p_addr {}", info.p2p_addr))? };
+    let me = commonware_cryptography::Signer::public_key(&key).address();
+    let addrs = match genesis.validators.iter().find(|v| v.address == me) {
+        Some(v) => NodeAddrs { p2p_addr: v.p2p_addr.clone(), http_addr: v.http_addr.clone() },
+        None => serde_json::from_slice(&std::fs::read(home.join("node.json")).context("validator.key isn't a genesis validator and node.json is missing — use `blockula validator init`")?)?,
+    };
+    let http_port = net.http_port.or_else(|| port_of(&addrs.http_addr).filter(|_| !addrs.http_addr.starts_with("http"))).unwrap_or(7070);
+    let p2p_port = if net.ephemeral_p2p { 0 } else { port_of(&addrs.p2p_addr).ok_or_else(|| anyhow!("bad p2p_addr {}", addrs.p2p_addr))? };
+    let listen = socket(&net.bind, p2p_port)?;
+    let http_bind = socket(&net.bind, http_port)?;
+    let dialable = if net.ephemeral_p2p { listen.into() } else { ingress(&addrs.p2p_addr)? };
+    let peers = if net.ephemeral_p2p { vec![] } else { http_peers(&genesis, &net.peer_http, Some(&me)) };
+
+    // Bootstrap from every validator we know of (genesis + on-chain registry).
+    let mut seen = std::collections::BTreeSet::new();
     let mut bootstrappers = vec![];
-    for v in &genesis.validators {
-        if v.address == me {
+    let known = genesis.validators.iter().map(|v| (v.address.clone(), v.public_key.clone(), v.p2p_addr.clone()))
+        .chain(chain.state.validators.values().filter(|v| v.status == crate::chain::ValidatorStatus::Active).map(|v| (v.address.clone(), v.consensus_key.clone(), v.p2p_addr.clone())));
+    for (addr, pk, p2p) in known {
+        if addr == me || !seen.insert(addr) {
             continue;
         }
-        let pk = crate::pq::PublicKey::from_bytes(&hex::decode(&v.public_key)?).ok_or_else(|| anyhow!("bad key"))?;
-        let addr: SocketAddr = v.p2p_addr.parse()?;
-        bootstrappers.push((pk, addr.into()));
+        let pk = crate::pq::PublicKey::from_bytes(&hex::decode(&pk)?).ok_or_else(|| anyhow!("bad key"))?;
+        match ingress(&p2p) {
+            Ok(i) => bootstrappers.push((pk, i)),
+            Err(e) => eprintln!("⚠️  skipping bootstrapper {p2p}: {e}"),
+        }
     }
-    println!(
-        "🧛 Blockula `{}` rising from height {} — validator {} of {} (simplex BFT, ML-DSA-65)",
-        genesis.chain_id,
-        chain.height(),
-        participants.iter().position(|p| p.address() == me).unwrap_or(0) + 1,
-        participants.len()
-    );
+    let preset = match net.p2p_preset.as_deref() {
+        Some(p @ ("local" | "recommended" | "public-nat")) => p.to_string(),
+        Some(other) => bail!("--p2p-preset must be local, recommended or public-nat, got {other}"),
+        None if net.ephemeral_p2p || is_private_host(&addrs.p2p_addr) => "local".into(),
+        None => "recommended".into(),
+    };
     let shared: Shared = Arc::new(Mutex::new(chain));
+    // Far behind (new validator, long downtime)? Catch up over HTTP first: verified batches,
+    // much faster than consensus backfill, and peers prune old consensus data.
+    if !peers.is_empty() {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        rt.block_on(catch_up(shared.clone(), peers.clone()));
+    }
+    {
+        let chain = shared.lock();
+        let epoch = chain.state.params.epoch_of(chain.height() + 1);
+        let active = chain.state.active_sets.get(&epoch).map(|s| s.len()).unwrap_or(0);
+        let voting = chain.state.active_sets.get(&epoch).is_some_and(|s| s.contains(&me));
+        println!(
+            "🧛 Blockula `{}` rising from height {} — epoch {epoch}, {active} active validator{}; this node {} (simplex BFT, ML-DSA-65)",
+            genesis.chain_id,
+            chain.height(),
+            if active == 1 { "" } else { "s" },
+            if voting { "votes" } else { "observes until it's in the active set" }
+        );
+    }
+    if net.ephemeral_p2p {
+        println!("🔗 p2p: single-validator dev chain, listening on {listen}");
+    } else {
+        println!("🔗 p2p: listening on {listen}, advertised as {} ({preset} preset)", addrs.p2p_addr);
+    }
+    consensus::log_memory_budget(bootstrappers.len());
     let block_time_ms = genesis.block_time_ms;
     let genesis_block = consensus::genesis_block(&genesis);
     let chain_id = genesis.chain_id.clone();
+    let client_ip = net.client_ip.clone();
 
     let cfg = cw_tokio::Config::new().with_storage_directory(home.join("consensus"));
     cw_tokio::Runner::new(cfg).start(|context| async move {
-        let mut p2p_cfg = discovery::Config::local(
-            key.clone(),
-            &[consensus::namespace(&chain_id).as_slice(), b"/p2p"].concat(),
-            listen,
-            listen,
-            bootstrappers,
-            NZUsize!(participants.len().max(2)),
-            MAX_MESSAGE_SIZE,
-        );
+        let ns = [consensus::namespace(&chain_id).as_slice(), b"/p2p"].concat();
+        let max_peers = NonZeroUsize::new(consensus::MAX_PEERS_PER_SET).unwrap();
+        let mut p2p_cfg = if preset == "local" {
+            discovery::Config::local(key.clone(), &ns, listen, dialable, bootstrappers, max_peers, MAX_MESSAGE_SIZE)
+        } else {
+            discovery::Config::recommended(key.clone(), &ns, listen, dialable, bootstrappers, max_peers, MAX_MESSAGE_SIZE)
+        };
+        if preset == "public-nat" {
+            // Recommended limits, but inbound connections arrive from a NAT/proxy's private address.
+            p2p_cfg.allow_private_ips = true;
+        }
         p2p_cfg.mailbox_size = NZUsize!(4096);
-        let (mut network, mut oracle) = discovery::Network::new(context.child("network"), p2p_cfg);
-        oracle.track(0, participants.clone());
-        let channels: Vec<_> = CHANNELS.iter().map(|c| network.register(*c, consensus::quota())).collect();
+        p2p_cfg.tracked_peer_sets = NonZeroUsize::new(consensus::TRACKED_PEER_SETS).unwrap();
+        let (mut network, oracle) = discovery::Network::new(context.child("network"), p2p_cfg);
+        let channels: Vec<_> = CHANNELS.iter().map(|c| network.register(*c, consensus::quota(*c))).collect();
         network.start();
 
-        let vcfg = ValidatorConfig { chain: shared.clone(), key, participants, genesis: genesis_block, chain_id, block_time_ms, partition: "blockula".into() };
+        let vcfg = ValidatorConfig { chain: shared.clone(), key, genesis: genesis_block, block_time_ms, epoch_blocks: genesis.epoch_blocks, partition: "blockula".into() };
         let (handle, marshal) = consensus::start_validator(context.child("node"), vcfg, oracle.clone(), oracle.clone(), channels).await;
-        tokio::spawn(serve_http(Node { chain: shared, marshal: Some(marshal), peers: vec![] }, http_port));
+        tokio::spawn(serve_http(Node::new(shared, Some(marshal), peers, client_ip), http_bind));
         if let Err(e) = handle.await {
             eprintln!("consensus stopped: {e:?}");
         }
@@ -102,8 +268,9 @@ struct JoinConfig {
     peers: Vec<String>,
 }
 
-/// Prepares a full-node home: genesis.json (copied or fetched from a validator) + join.json.
-pub fn join(genesis: &str, home: &Path) -> Result<()> {
+/// Prepares a full-node home: genesis.json (copied or fetched from a node) + join.json.
+/// `genesis_hash` pins the chain: the join fails unless genesis hashes to it.
+pub fn join(genesis: &str, home: &Path, genesis_hash: Option<&str>) -> Result<()> {
     std::fs::create_dir_all(home)?;
     if home.join("validator.key").exists() {
         bail!("{} is a validator home", home.display());
@@ -116,10 +283,17 @@ pub fn join(genesis: &str, home: &Path) -> Result<()> {
     } else {
         (Genesis::load(Path::new(genesis))?, vec![])
     };
-    for v in &g.validators {
-        let url = format!("http://{}", v.http_addr);
-        if !peers.contains(&url) {
-            peers.push(url);
+    let hash = hex::encode(consensus::genesis_block(&g).digest_bytes());
+    if let Some(want) = genesis_hash {
+        if want.to_lowercase() != hash {
+            bail!("genesis hash mismatch: expected {want}, got {hash} — wrong chain or tampered genesis");
+        }
+    } else {
+        println!("⚠️  genesis hash {hash} (pin it next time with --genesis-hash)");
+    }
+    for u in http_peers(&g, &[], None) {
+        if !peers.contains(&u) {
+            peers.push(u);
         }
     }
     let path = home.join("genesis.json");
@@ -135,73 +309,143 @@ pub fn join(genesis: &str, home: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn run_full_node(home: PathBuf, port: u16) -> Result<()> {
+pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
+    let bind = socket(&net.bind, net.http_port.unwrap_or(7171))?;
     let jc: JoinConfig = serde_json::from_slice(&std::fs::read(home.join("join.json")).context("not a joined home — use `blockula join`")?)?;
     let chain = Chain::open(&home)?;
-    println!("🦇 Full node for `{}` at height {} — syncing from {}", chain.genesis.chain_id, chain.height(), jc.peers.join(", "));
+    let peers = if net.peer_http.is_empty() { jc.peers } else { http_peers(&chain.genesis, &net.peer_http, None) };
+    println!("🦇 Full node for `{}` at height {} — syncing from {}", chain.genesis.chain_id, chain.height(), peers.join(", "));
     let shared: Shared = Arc::new(Mutex::new(chain));
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
-        tokio::spawn(serve_http(Node { chain: shared.clone(), marshal: None, peers: jc.peers.clone() }, port));
-        sync_loop(shared, jc.peers).await;
+        tokio::spawn(serve_http(Node::new(shared.clone(), None, peers.clone(), net.client_ip.clone()), bind));
+        sync_loop(shared, peers, false).await;
     });
     Ok(())
 }
 
 #[derive(Deserialize)]
 struct SyncBatch {
+    #[serde(default)]
     tip: u64,
     blocks: Vec<String>,
     to: Option<u64>,
     finalization: Option<String>,
 }
 
-async fn sync_loop(chain: Shared, peers: Vec<String>) {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build().unwrap();
-    let (verifier, block_time) = {
+/// Largest `/api/sync` response we'll read (500 blocks × 4 MiB is the protocol max, but honest
+/// batches are far smaller; anything bigger is cut off and the peer rotated).
+pub const MAX_SYNC_RESPONSE: usize = 32 << 20;
+
+async fn get_capped(client: &reqwest::Client, url: &str, cap: usize) -> Result<Vec<u8>> {
+    let mut res = client.get(url).send().await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        bail!("{status}");
+    }
+    if res.content_length().is_some_and(|l| l as usize > cap) {
+        bail!("response too large");
+    }
+    let mut body = vec![];
+    while let Some(chunk) = res.chunk().await? {
+        body.extend_from_slice(&chunk);
+        if body.len() > cap {
+            bail!("response too large");
+        }
+    }
+    Ok(body)
+}
+
+/// One sync round against `peer`. Ok(true) = applied blocks, Ok(false) = peer had nothing new.
+async fn sync_once(chain: &Shared, provider: &consensus::EpochProvider, client: &reqwest::Client, peer: &str) -> Result<bool> {
+    // Batches never cross an epoch boundary: each is verified with that epoch's validator set,
+    // which we learn by executing the previous epoch's last block.
+    let (from, limit, epoch) = {
         let c = chain.lock();
-        let parts = consensus::participants(&c.genesis).expect("genesis validators");
-        (MlDsaScheme::verifier(&consensus::namespace(&c.genesis.chain_id), parts), Duration::from_millis(c.genesis.block_time_ms))
+        let from = c.height() + 1;
+        let epoch = c.state.params.epoch_of(from);
+        (from, (c.state.params.last_of(epoch) - from + 1).min(200), epoch)
     };
-    let mut peer = 0;
+    let verifier = provider.epoch_scheme(epoch).ok_or_else(|| anyhow!("no validator set known for epoch {epoch}"))?;
+    let body = get_capped(client, &format!("{peer}/api/sync?from={from}&limit={limit}"), MAX_SYNC_RESPONSE).await?;
+    let batch: SyncBatch = serde_json::from_slice(&body)?;
+    if batch.blocks.is_empty() {
+        if batch.tip >= from {
+            bail!("peer claims height {} but sent nothing", batch.tip);
+        }
+        return Ok(false);
+    }
+    apply_batch(chain, &verifier, epoch, &batch)?;
+    Ok(true)
+}
+
+/// Follows peers forever (full nodes). Peers rotate on errors, bad batches and empty replies,
+/// so one stalling or lying peer can't hold the node back.
+async fn sync_loop(chain: Shared, peers: Vec<String>, stop_when_caught_up: bool) {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().unwrap();
+    let provider = consensus::EpochProvider::new(chain.clone(), None);
+    let block_time = Duration::from_millis(chain.lock().genesis.block_time_ms);
+    if peers.is_empty() {
+        eprintln!("❌ no peers to sync from (set --peer-http)");
+        return;
+    }
+    let mut peer = 0usize;
+    let mut idle_rounds = 0usize;
+    let mut failures = 0usize;
     loop {
-        let from = chain.lock().height() + 1;
-        let url = format!("{}/api/sync?from={from}&limit=200", peers[peer % peers.len()]);
-        let result: Result<SyncBatch> = async { Ok(client.get(&url).send().await?.error_for_status()?.json().await?) }.await;
-        match result {
-            Ok(batch) => {
-                {
-                    let mut c = chain.lock();
-                    c.finalized_tip = c.finalized_tip.max(batch.tip);
+        let url = &peers[peer % peers.len()];
+        match sync_once(&chain, &provider, &client, url).await {
+            Ok(true) => {
+                idle_rounds = 0;
+                failures = 0;
+            }
+            Ok(false) => {
+                idle_rounds += 1;
+                peer += 1; // ask someone else next time, so no single peer can stall us
+                if stop_when_caught_up && idle_rounds >= peers.len() {
+                    return;
                 }
-                if batch.blocks.is_empty() {
-                    tokio::time::sleep(block_time / 2).await;
-                    continue;
-                }
-                if let Err(e) = apply_batch(&chain, &verifier, &batch) {
-                    eprintln!("⚠️  rejected sync batch from {}: {e:#}", peers[peer % peers.len()]);
-                    peer += 1;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
+                tokio::time::sleep(block_time / peers.len().max(1) as u32).await;
             }
             Err(e) => {
-                tracing::debug!(error = %e, "sync request failed");
+                tracing::debug!(peer = %url, error = %e, "sync round failed");
+                if !e.to_string().contains("sent nothing") {
+                    eprintln!("⚠️  sync from {url}: {e:#}");
+                }
                 peer += 1;
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                failures += 1;
+                if stop_when_caught_up && failures >= peers.len() * 2 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
     }
 }
 
+/// Validators: sync over HTTP until no peer has anything newer (or none answer).
+async fn catch_up(chain: Shared, peers: Vec<String>) {
+    let start = chain.lock().height();
+    sync_loop(chain.clone(), peers, true).await;
+    let end = chain.lock().height();
+    if end > start {
+        println!("⏩ caught up over HTTP: {start} → {end}");
+    }
+}
+
 /// Verifies a batch (contiguous heights, hash-linked to our tip, quorum finalization over the
 /// last block) and executes it.
-fn apply_batch(chain: &Shared, verifier: &MlDsaScheme, batch: &SyncBatch) -> Result<()> {
+fn apply_batch(chain: &Shared, verifier: &MlDsaScheme, epoch: u64, batch: &SyncBatch) -> Result<()> {
     let blocks: Vec<CBlock> = batch.blocks.iter().map(|h| Ok(CBlock::decode(hex::decode(h)?.as_slice())?)).collect::<Result<_>>()?;
     let fin_hex = batch.finalization.as_ref().ok_or_else(|| anyhow!("missing finalization"))?;
-    let fin = Finalization::<MlDsaScheme, Digest>::decode_cfg(hex::decode(fin_hex)?.as_slice(), &verifier.certificate_codec_config())?;
+    let fin_bytes = hex::decode(fin_hex)?;
+    let fin = Finalization::<MlDsaScheme, Digest>::decode_cfg(fin_bytes.as_slice(), &verifier.certificate_codec_config())?;
     let last = blocks.last().ok_or_else(|| anyhow!("empty batch"))?;
     if Some(last.height) != batch.to || fin.proposal.payload != last.digest() {
         bail!("finalization does not cover the batch");
+    }
+    if fin.proposal.round.epoch().get() != epoch {
+        bail!("finalization is from epoch {}, expected {epoch}", fin.proposal.round.epoch().get());
     }
     if !fin.verify(&mut commonware_utils::sys_rng(), verifier, &commonware_parallel::Sequential) {
         bail!("invalid finalization certificate");
@@ -217,8 +461,88 @@ fn apply_batch(chain: &Shared, verifier: &MlDsaScheme, batch: &SyncBatch) -> Res
         height = b.height;
     }
     for b in &blocks {
-        let cert = if b.height == last.height { fin_hex.clone() } else { String::new() };
+        let cert = (b.height == last.height).then(|| fin_bytes.clone());
         c.execute(consensus::finalized_from(b, cert))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::SummonOpts;
+
+    fn home(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("blockula-node-{tag}-{}-{}", crate::chain::now_ms(), std::process::id()))
+    }
+
+    #[test]
+    fn double_sign_guard_refuses_copied_homes_and_other_machines() {
+        let h = home("guard");
+        std::fs::create_dir_all(&h).unwrap();
+        // Fresh validator: nothing to protect.
+        double_sign_guard_with(&h, 0, false, None).unwrap();
+        // Has executed blocks but no consensus journal: a restored/copied home.
+        let err = double_sign_guard_with(&h, 10, false, None).unwrap_err().to_string();
+        assert!(err.contains("double-sign"), "{err}");
+        double_sign_guard_with(&h, 10, true, None).unwrap();
+        // machine.lock pins the home to one instance.
+        std::fs::create_dir_all(h.join("consensus").join("x")).unwrap();
+        double_sign_guard_with(&h, 10, false, Some("machine-a".into())).unwrap();
+        double_sign_guard_with(&h, 10, false, Some("machine-a".into())).unwrap();
+        assert!(double_sign_guard_with(&h, 10, false, Some("machine-b".into())).unwrap_err().to_string().contains("machine-a"));
+        std::fs::remove_dir_all(h).ok();
+    }
+
+    #[test]
+    fn peer_http_replaces_genesis_list_and_urls_are_accepted() {
+        let root = home("peers");
+        let homes = Chain::summon(&root, &SummonOpts::new("peers", 2)).unwrap();
+        let mut g = Genesis::load(&homes[0].join("genesis.json")).unwrap();
+        g.validators[0].http_addr = "https://rpc.example.com".into();
+        let me = g.validators[1].address.clone();
+        assert_eq!(http_peers(&g, &[], Some(&me)), vec!["https://rpc.example.com".to_string()]);
+        let over = vec!["http://blockula-v0.internal:7070".to_string(), "10.0.0.2:7070".to_string()];
+        assert_eq!(http_peers(&g, &over, Some(&me)), vec!["http://blockula-v0.internal:7070".to_string(), "http://10.0.0.2:7070".to_string()]);
+        crate::chain::check_http_addr("https://blockula-testnet.fly.dev").unwrap();
+        assert!(crate::chain::check_http_addr("https://bad host").is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn join_pins_the_genesis_hash() {
+        let root = home("pin");
+        let homes = Chain::summon(&root, &SummonOpts::new("pin", 1)).unwrap();
+        let g = Genesis::load(&homes[0].join("genesis.json")).unwrap();
+        let hash = hex::encode(consensus::genesis_block(&g).digest_bytes());
+        let gpath = homes[0].join("genesis.json");
+        assert!(join(gpath.to_str().unwrap(), &root.join("full-bad"), Some(&"00".repeat(32))).unwrap_err().to_string().contains("mismatch"));
+        join(gpath.to_str().unwrap(), &root.join("full-ok"), Some(&hash)).unwrap();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A peer that claims a huge tip but sends nothing, or streams an endless body, must not
+    /// stall or exhaust a joining node.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_rejects_lying_and_oversized_peers() {
+        use axum::{routing::get, Router};
+        let root = home("evil");
+        let homes = Chain::summon(&root, &SummonOpts::new("evil", 1)).unwrap();
+        let chain: Shared = Arc::new(Mutex::new(Chain::open(&homes[0]).unwrap()));
+        let app = Router::new()
+            .route("/liar/api/sync", get(|| async { axum::Json(serde_json::json!({ "tip": 1_000_000_000_000u64, "blocks": [], "to": null, "finalization": null })) }))
+            .route("/huge/api/sync", get(|| async { "x".repeat(MAX_SYNC_RESPONSE + 1) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let provider = consensus::EpochProvider::new(chain.clone(), None);
+        let liar = sync_once(&chain, &provider, &client, &format!("http://{addr}/liar")).await.unwrap_err().to_string();
+        assert!(liar.contains("sent nothing"), "{liar}");
+        let huge = sync_once(&chain, &provider, &client, &format!("http://{addr}/huge")).await.unwrap_err().to_string();
+        assert!(huge.contains("too large"), "{huge}");
+        // Claims never move our finalized tip; only verified certificates do.
+        assert_eq!(chain.lock().finalized_tip, 0);
+        std::fs::remove_dir_all(root).ok();
+    }
 }

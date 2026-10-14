@@ -5,13 +5,15 @@ mod crypto;
 mod node;
 mod pq;
 mod types;
+mod validator_cli;
 
 #[cfg(test)]
 mod sim;
 
 use anyhow::Result;
-use chain::Chain;
-use clap::{Parser, Subcommand};
+use chain::{Chain, SummonOpts};
+use clap::{Args, Parser, Subcommand};
+use node::NetOpts;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -19,6 +21,28 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Args, Clone)]
+struct Net {
+    /// Interface to listen on for HTTP and p2p: 127.0.0.1 (default), 0.0.0.0 or :: for servers
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: String,
+    /// IP of a proxy or full node whose `X-Blockula-Client-IP` header is trusted for faucet/tx
+    /// rate limits (repeatable)
+    #[arg(long = "trusted-forwarder")]
+    trusted_forwarders: Vec<std::net::IpAddr>,
+    /// Reverse-proxy header holding the real client IP (e.g. `fly-client-ip`). Only set this when
+    /// every request reaches the node through that proxy; otherwise clients can spoof it.
+    #[arg(long)]
+    client_ip_header: Option<String>,
+    /// HTTP peer to sync from and forward txs/faucet requests to (repeatable). Replaces the
+    /// genesis validators' http addresses entirely (e.g. http://blockula-v0.internal:7070).
+    #[arg(long = "peer-http")]
+    peer_http: Vec<String>,
+    /// Skip the double-signing guards (missing consensus journal, machine.lock mismatch).
+    #[arg(long = "i-know-this-key-is-not-running-elsewhere")]
+    force_key: bool,
 }
 
 #[derive(Subcommand)]
@@ -30,6 +54,8 @@ enum Cmd {
         /// Wipe the dev chain and start fresh
         #[arg(long)]
         reset: bool,
+        #[command(flatten)]
+        net: Net,
     },
     /// Create a brand-new chain of your own (genesis + validator keys)
     Summon {
@@ -40,19 +66,34 @@ enum Cmd {
         no_faucet: bool,
         #[arg(long, default_value = "1000")]
         block_time_ms: u64,
-        /// Number of validators. With N > 1, `home/v0 … home/vN-1` are created for a local testnet.
+        /// Number of genesis validators. With N > 1, `home/v0 … home/vN-1` are created.
         #[arg(long, default_value = "1")]
         validators: usize,
+        /// Season 0 validator admin account (repeatable). Default: the first validator's account.
+        #[arg(long = "admin")]
+        admins: Vec<String>,
+        /// Blocks per epoch; the validator set changes only at epoch boundaries
+        #[arg(long, default_value = "600")]
+        epoch_blocks: u64,
+        /// Minimum validator bond in FANG (default: 50 with a faucet, 10000 without)
+        #[arg(long)]
+        min_bond: Option<String>,
     },
     /// Run a validator (a home with validator.key) or a joined full node
     Run {
         #[arg(long)]
         home: PathBuf,
-        /// HTTP port (defaults to the one in genesis for validators, 7171 for full nodes)
+        /// HTTP port (default: from the advertised http_addr for validators, 7171 for full nodes)
         #[arg(long)]
         port: Option<u16>,
+        /// p2p preset: `local` (private IPs allowed) or `recommended` (public networks).
+        /// Default: local if this validator's advertised p2p address is private.
+        #[arg(long)]
+        p2p_preset: Option<String>,
+        #[command(flatten)]
+        net: Net,
     },
-    /// Join an existing chain as a full node: sync finalized blocks from a validator and serve the API
+    /// Join an existing chain as a full node: sync finalized blocks from validators and serve the API
     Join {
         /// genesis.json path, or a validator's HTTP URL (e.g. http://127.0.0.1:7070)
         #[arg(long)]
@@ -61,6 +102,21 @@ enum Cmd {
         home: PathBuf,
         #[arg(long, default_value = "7171")]
         port: u16,
+        /// Refuse to join unless genesis hashes to this (printed by `summon`, in /api/genesis)
+        #[arg(long)]
+        genesis_hash: Option<String>,
+        #[command(flatten)]
+        net: Net,
+    },
+    /// A simple command-line wallet (key in ~/.blockula/wallet.json, mode 600)
+    Wallet {
+        #[command(subcommand)]
+        cmd: validator_cli::WalletCmd,
+    },
+    /// Become (or manage) a validator
+    Validator {
+        #[command(subcommand)]
+        cmd: validator_cli::ValidatorCmd,
     },
     /// Generate an ML-DSA-65 keypair
     Keygen,
@@ -70,15 +126,24 @@ fn blockula_dir() -> PathBuf {
     std::env::var_os("BLOCKULA_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join(".blockula"))
 }
 
+fn net_opts(net: Net, http_port: Option<u16>, p2p_preset: Option<String>, ephemeral_p2p: bool) -> NetOpts {
+    let client_ip = api::ClientIpPolicy {
+        trusted_forwarders: net.trusted_forwarders,
+        forwarder_secret: std::env::var("BLOCKULA_FORWARDER_SECRET").ok().filter(|s| s.len() >= 32),
+        header: net.client_ip_header.map(|h| h.to_lowercase()),
+    };
+    NetOpts { bind: net.bind, http_port, p2p_preset, ephemeral_p2p, client_ip, peer_http: net.peer_http, force_key: net.force_key }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("BLOCKULA_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,blockula=info")))
         .with_writer(std::io::stderr)
         .init();
     match Cli::parse().cmd {
-        Cmd::Dev { port, reset } => {
+        Cmd::Dev { port, reset, net } => {
             let home = blockula_dir().join("dev");
-            let stale = home.join("genesis.json").exists() && chain::Genesis::load(&home.join("genesis.json")).is_err();
+            let stale = home.join("genesis.json").exists() && (chain::Genesis::load(&home.join("genesis.json")).is_err() || node::dev_is_stale(&home));
             if reset || stale {
                 if stale {
                     eprintln!("♻️  The dev chain was made by an older Blockula; starting a fresh one.");
@@ -86,35 +151,50 @@ fn main() -> Result<()> {
                 std::fs::remove_dir_all(&home).ok();
             }
             if !home.join("genesis.json").exists() {
-                Chain::summon(&home, "blockula-dev", true, 1000, 1, Some(port))?;
+                Chain::summon(&home, &SummonOpts { http_port: Some(port), ..SummonOpts::new("blockula-dev", 1) })?;
             }
-            node::run_validator(home, Some(port))
+            node::run_validator(home, net_opts(net, Some(port), Some("local".into()), true))
         }
-        Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators } => {
+        Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators, admins, epoch_blocks, min_bond } => {
             let home = home.unwrap_or_else(|| blockula_dir().join(&chain_id));
             if home.join("genesis.json").exists() {
                 anyhow::bail!("{} already has a chain", home.display());
             }
-            // A single-validator chain keeps the classic port; testnets get free ports.
-            let homes = Chain::summon(&home, &chain_id, !no_faucet, block_time_ms, validators, (validators == 1).then_some(7070))?;
+            let opts = SummonOpts {
+                chain_id: chain_id.clone(),
+                faucet: !no_faucet,
+                block_time_ms,
+                validators,
+                // A single-validator chain keeps the classic port; testnets get free ports.
+                http_port: (validators == 1).then_some(7070),
+                admins,
+                epoch_blocks,
+                min_bond: min_bond.map(|b| validator_cli::parse_fang(&b)).transpose()?,
+            };
+            let homes = Chain::summon(&home, &opts)?;
             let g = chain::Genesis::load(&homes[0].join("genesis.json"))?;
             println!("🪦 Summoned chain `{chain_id}` with {validators} validator{} at {}", if validators == 1 { "" } else { "s" }, home.display());
             for (h, v) in homes.iter().zip(&g.validators) {
                 println!("   blockula run --home {}    # http://{}  p2p {}", h.display(), v.http_addr, v.p2p_addr);
             }
+            println!("   genesis hash: {}  (joiners can pin it with --genesis-hash)", hex::encode(consensus::genesis_block(&g).digest_bytes()));
+            println!("   epochs: {} blocks · min bond: {} · validator admins: {}", g.epoch_blocks, types::fmt_fang(g.min_bond), g.validator_admins.join(", "));
+            println!("   (Edit validators[].p2p_addr / http_addr in genesis.json before the first start if nodes will be reached at other addresses; every node must use the same file.)");
             Ok(())
         }
-        Cmd::Run { home, port } => {
+        Cmd::Run { home, port, p2p_preset, net } => {
             if home.join("validator.key").exists() {
-                node::run_validator(home, port)
+                node::run_validator(home, net_opts(net, port, p2p_preset, false))
             } else {
-                node::run_full_node(home, port.unwrap_or(7171))
+                node::run_full_node(home, net_opts(net, Some(port.unwrap_or(7171)), p2p_preset, false))
             }
         }
-        Cmd::Join { genesis, home, port } => {
-            node::join(&genesis, &home)?;
-            node::run_full_node(home, port)
+        Cmd::Wallet { cmd } => validator_cli::wallet(cmd, &blockula_dir()),
+        Cmd::Join { genesis, home, port, genesis_hash, net } => {
+            node::join(&genesis, &home, genesis_hash.as_deref())?;
+            node::run_full_node(home, net_opts(net, Some(port), None, false))
         }
+        Cmd::Validator { cmd } => validator_cli::run(cmd),
         Cmd::Keygen => {
             let k = crypto::Keys::generate();
             println!("{}", serde_json::json!({ "address": k.address(), "seed": k.seed_hex() }));

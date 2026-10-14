@@ -2,17 +2,33 @@
 
 import { Client, Wallet } from "@blockula/sdk";
 import { createPasskeyWallet, unlockPasskeyWallet } from "@blockula/sdk/passkey";
+import { RP_ID } from "./config";
 import { b64url, fromB64url, type Hint } from "./session";
 import type { AccountView, KeyAccounts } from "./types";
 
+const DEV_HOSTS = ["localhost", "127.0.0.1"];
+
+/**
+ * Passkey wallets are bound to one hostname for good. Only allow them on the production domain
+ * (or localhost for development), never on preview deployments that will disappear.
+ */
+function walletRpId(): string {
+  const host = window.location.hostname;
+  if (DEV_HOSTS.includes(host)) return host;
+  if (host !== RP_ID) {
+    throw new Error(`Passkey wallets live at https://${RP_ID}. A wallet made here (${host}) couldn't be opened anywhere else, so open the wallet at ${RP_ID} instead.`);
+  }
+  return RP_ID;
+}
+
 export async function createPasskey(client: Client, username: string) {
-  const wallet = await createPasskeyWallet({ username, client, rpName: "Blockula Wallet" });
+  const wallet = await createPasskeyWallet({ username, client, rpName: "Blockula Wallet", rpId: walletRpId() });
   const credentialId = wallet.credentialId ? b64url(wallet.credentialId) : undefined;
   return { wallet, hint: { v: 1, kind: "passkey", credentialId, keyId: wallet.keyId } satisfies Hint };
 }
 
 export async function unlockPasskey(client: Client, credentialId?: string) {
-  const wallet = await unlockPasskeyWallet({ client, credentialId: credentialId ? fromB64url(credentialId) : undefined });
+  const wallet = await unlockPasskeyWallet({ client, rpId: walletRpId(), credentialId: credentialId ? fromB64url(credentialId) : undefined });
   return { wallet, credentialId: wallet.credentialId ? b64url(wallet.credentialId) : credentialId };
 }
 

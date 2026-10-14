@@ -6,20 +6,23 @@
 claude mcp add blockula -- npx -y @blockula/mcp
 ```
 
-**Tools:** `status`, `start_dev_node`, `summon_chain`, `create_wallet`, `use_account`, `wallet_info`, `faucet`, `send`, `check_name`, `register_name`, `lookup`, `latest_blocks`.
+It works with zero setup: if no local node is running, it connects to the public testnet at `https://blockula-testnet.fly.dev`. Call `status` to see which node you're on.
+
+**Tools:** `status`, `tx_status`, `start_dev_node`, `summon_chain`, `create_wallet`, `use_account`, `wallet_info`, `faucet`, `send`, `check_name`, `register_name`, `lookup`, `latest_blocks`.
 
 **Spending a user's money safely:**
 1. `create_wallet` gives you a `key_id`. Hand it to the user.
-2. The user grants it a budget in the Blockula web wallet (Devices & agents → Give an agent a budget). The chain enforces the limit and expiry.
+2. The user grants it a budget in the Blockula web wallet at https://blockula-wallet.vercel.app (Devices & agents → Give an agent a budget). The chain enforces the limit and expiry.
 3. `use_account("theirname.boo")`, then `send`.
 
 | Env | Default | |
 |---|---|---|
-| `BLOCKULA_RPC` | `http://localhost:7070` | node URL |
+| `BLOCKULA_RPC` | local node if running, else the public testnet | node URL |
 | `BLOCKULA_HOME` | `~/.blockula` | where the agent key is stored (mode 600) |
 | `BLOCKULA_MAX_SEND` | `100` | max FANG per `send` call |
+| `BLOCKULA_MAX_DAILY` | `100` | max FANG sent per UTC day across all calls (persisted in `BLOCKULA_HOME`) |
 | `BLOCKULA_BIN` | `blockula` | node binary used by `start_dev_node` / `summon_chain` |
 
-`start_dev_node` and `summon_chain` need the `blockula` node binary on your PATH. All other tools work against any reachable node.
+`start_dev_node` and `summon_chain` need the `blockula` node binary (build it from the Blockula repo with `cargo build --release`). Every other tool works against the public testnet without it.
 
 ⚠️ Early and unaudited: test chains only.

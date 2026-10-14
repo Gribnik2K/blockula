@@ -6,7 +6,9 @@
 - [README](README.md): quickstart, SDK examples, run your own chain
 - [Plan](docs/PLAN.md): architecture, privacy (Ghost Mode), tokenomics, roadmap
 
+Public testnet: https://blockula-testnet.fly.dev · Wallet: https://blockula-wallet.vercel.app · One-pager: docs/ONE_PAGER.md
+
 ## Fastest path
-1. `claude mcp add blockula -- npx -y @blockula/mcp`
-2. MCP: start_dev_node → create_wallet → faucet → send / register_name
+1. `claude mcp add blockula -- npx -y @blockula/mcp` (uses the public testnet automatically)
+2. MCP: create_wallet → faucet → register_name / send (start_dev_node for a local chain, needs the node binary)
 3. App code: `import { Wallet, Client } from "@blockula/sdk"`; browser users: `import { createPasskeyWallet } from "@blockula/sdk/passkey"`

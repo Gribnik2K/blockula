@@ -28,7 +28,7 @@ export function friendly(e: unknown): string {
     [/names can't start or end/, "Names can't start or end with a dash."],
     [/still pending after/, "The network is taking a moment to confirm. Check your activity shortly."],
     [/PRF extension/, "Your passkey provider doesn't support the PRF extension, which Blockula needs to derive your quantum-safe key."],
-    [/Failed to fetch|NetworkError|Load failed|fetch failed/i, `Can't reach the Blockula node at ${RPC}. Start one with \`blockula dev\`, or point this wallet at another node by adding ?rpc=https://your-node to the URL.`],
+    [/Failed to fetch|NetworkError|Load failed|fetch failed/i, `Can't reach the Blockula node at ${RPC}. Pick another network in the menu at the top, or start a local node with \`blockula dev\`.`],
   ];
   if (name === "NotAllowedError") return "The passkey prompt was cancelled or timed out.";
   if (name === "InvalidStateError") return "This device already has a passkey for this wallet.";

@@ -25,6 +25,7 @@
   .summary { font-size:17px; }
   .pill { display:inline-block; padding:2px 8px; border-radius:99px; font-size:12px; background:#2a1d36; color:var(--slime); }
   .pill.pending { color:var(--pumpkin); }
+  .pill.failed { color:#ff6b6b; }
   dl { display:grid; grid-template-columns:200px 1fr; gap:10px 16px; margin:0; } dt { color:var(--dim); }
   .term { border-bottom:1px dotted var(--dim); cursor:help; position:relative; }
   .term:hover::after { content:attr(data-tip); position:absolute; left:0; top:100%; margin-top:6px; width:300px; padding:10px 12px; border-radius:10px; background:#241830; border:1px solid var(--line); color:var(--text); font-size:13px; z-index:5; white-space:normal; }
@@ -38,7 +39,7 @@
 <header>
   <h1><a href="#/">🧛 Blockula</a></h1>
   <form id="search"><input id="q" placeholder="Search a name (jack.boo), address, block # or tx…" autocomplete="off" /></form>
-  <nav><a href="#/learn">📖 Learn</a><a href="#/">⛓️ Blocks</a></nav>
+  <nav><a href="#/learn">📖 Learn</a><a href="#/">⛓️ Blocks</a><a href="#/validators">🧛 Validators</a><a href="#/mempool">⏳ Mempool</a></nav>
 </header>
 <main id="app">Rising from the grave…</main>
 <script>
@@ -58,6 +59,8 @@ const GLOSSARY = {
   address: "Your account ID: bech32m('boo', BLAKE3(public key)). You rarely need to see it — names like jack.boo point to it.",
   name: "A human-readable .boo name that points to an address, like a domain name for your wallet.",
   finalized: "Included in a block. On Blockula, once a block is sealed it's final — no waiting for confirmations.",
+  epoch: "A stretch of blocks with a fixed validator set. Changes to the set (new validators, removals) only take effect when the next epoch starts.",
+  bond: "FANG a validator locks up to take part. It can be reclaimed one epoch after the validator leaves.",
   proposer: "The validator that proposed this block. A 2/3+ quorum of validators then voted (ML-DSA-65 signatures) to finalize it.",
   certificate: "The finality proof: ML-DSA-65 votes from a 2/3+ quorum of validators. Blocks finalized as an ancestor of a later block share that later block's certificate.",
   burned: "Fees destroyed forever. Burning offsets new issuance and ties the token's value to real network usage.",
@@ -67,8 +70,23 @@ const who = (l) => l ? `<a href="#/account/${esc(l.name && !l.name.includes(" ")
 
 const views = {
   async home() {
-    const [s, blocks] = await Promise.all([api("/status"), api("/blocks?limit=15")]);
+    const [s, blocks, v, health] = await Promise.all([
+      api("/status"), api("/blocks?limit=15"), api("/validators").catch(() => null),
+      fetch("/api/health").then((r) => r.json()).catch(() => ({ ok: false, reason: "unreachable" })),
+    ]);
+    const age = s.head_age_ms != null ? Math.round(s.head_age_ms / 1000) : null;
     return `
+      <div class="card" style="margin-bottom:16px"><h2>${health.ok ? "🟢" : "🟠"} Network health</h2>
+        <div class="grid">
+          <div class="stat"><div class="v">#${s.height}</div><div class="k">height${s.syncing ? ` · syncing to #${s.finalized_height}` : ""}</div></div>
+          <div class="stat"><div class="v">${age == null ? "—" : age + "s"}</div><div class="k">since the last block</div></div>
+          <div class="stat"><div class="v">${s.active_validators}</div><div class="k"><a href="#/validators">validators</a> in ${term("epoch")} ${s.epoch}</div></div>
+          <div class="stat"><div class="v">${s.mempool}</div><div class="k"><a href="#/mempool">pending txs</a></div></div>
+        </div>
+        ${health.ok ? "" : `<div class="dim">${esc(health.reason || "")}</div>`}
+        ${v ? `<div class="dim">${v.blocks_until_next_epoch} blocks until epoch ${v.epoch + 1}${v.pending.length ? ` · ${v.pending.length} validator${v.pending.length == 1 ? "" : "s"} awaiting approval` : ""}</div>` : ""}
+      </div>`
+      + `
       <div class="grid">
         <div class="card stat"><div class="v">#${s.height}</div><div class="k">${term("height", "latest block")}</div></div>
         <div class="card stat"><div class="v">${esc(s.supply_display)}</div><div class="k">total supply</div></div>
@@ -101,9 +119,13 @@ const views = {
   },
   async tx(id) {
     const t = await api("/tx/" + id);
+    if (t.status === "failed" && !t.from) {
+      return `<div class="card"><div class="summary">❌ This transaction didn't go through</div><span class="pill failed">failed</span><p>${esc(t.error || "")}</p><p class="dim">It was dropped around block #${t.height}. Nothing moved; if it was included, only the fee was charged.</p></div>`;
+    }
     return `
       <div class="card"><div class="summary">${esc(t.summary)}</div>
         <span class="pill ${t.status}">${term("finalized", t.status)}</span> ${t.height ? `in <a href="#/block/${t.height}">block #${t.height}</a>` : ""}
+        ${t.error ? `<p>❌ The action failed: ${esc(t.error)}. The fee was still charged.</p>` : ""}
         ${t.memo ? `<p>💬 “${esc(t.memo)}”</p>` : ""}</div><br>
       <div class="card"><dl>
         <dt>From</dt><dd>${who(t.from)}</dd>
@@ -145,6 +167,45 @@ const views = {
       <li><b>Coming soon: 👻 Ghost Mode.</b> Private transfers using zero-knowledge proofs (hash-based STARKs, also quantum-safe). The explorer will show <i>that</i> something happened, but not who or how much.</li>
     </ol><p>Try it: search for a name above, or open the <a href="#/">latest blocks</a> and click around. Every dotted word has an explanation if you hover.</p></div>`;
   },
+};
+
+views.mempool = async function () {
+  const m = await api("/mempool?limit=100");
+  return `<div class="card learn"><h2>⏳ Waiting to be included</h2><p>Transactions this node has accepted but no block has finalized yet. Validators pick them up in the next few blocks; ones that can't apply anymore (or wait too long) are dropped.</p></div><br>
+    <div class="card"><h2>Pending (${m.count})</h2>${m.txs.length ? m.txs.map(txRow).join("") : '<div class="dim">Nothing pending. 🕸️</div>'}</div>`;
+};
+
+views.validators = async function () {
+  const v = await api("/validators");
+  const row = (x) => `<div class="row"><div>${who(x.validator)} <span class="dim">${esc(x.p2p_addr)}${x.genesis ? " · genesis" : ""}${x.bond !== "0" ? " · " + term("bond", "bond") + " " + esc(x.bond_display) : ""}</span></div><span class="pill">${esc(x.status)}</span></div>`;
+  const list = (title, xs, empty) => `<div class="card"><h2>${title} (${xs.length})</h2>${xs.length ? xs.map(row).join("") : `<div class="dim">${empty}</div>`}</div><br>`;
+  const all = [...v.active, ...v.pending, ...v.approved, ...v.removed];
+  const seen = new Set();
+  const events = [];
+  for (const x of all) {
+    if (seen.has(x.validator.address)) continue;
+    seen.add(x.validator.address);
+    if (x.registered_at && !x.genesis) events.push([x.registered_at, `${who(x.owner)} bonded ${esc(x.bond_display)} and registered validator ${who(x.validator)}`]);
+    if (x.approved_by) events.push([x.approved_at, `${who(x.approved_by)} approved validator ${who(x.validator)}${x.active_from_epoch != null ? `, active from ${term("epoch")} ${x.active_from_epoch}` : ", joining at the next epoch"}`]);
+    if (x.removed_by) events.push([x.removed_at, `${who(x.removed_by)} removed validator ${who(x.validator)}${x.active_until_epoch != null ? `, last active in epoch ${x.active_until_epoch}` : ", leaving at the next epoch"}`]);
+  }
+  events.sort((a, b) => b[0] - a[0]);
+  return `
+    <div class="grid">
+      <div class="card stat"><div class="v">${v.epoch}</div><div class="k">${term("epoch", "current epoch")}</div></div>
+      <div class="card stat"><div class="v">${v.active.length}</div><div class="k">active validators</div></div>
+      <div class="card stat"><div class="v">${v.blocks_until_next_epoch}</div><div class="k">blocks until the next epoch</div></div>
+      <div class="card stat"><div class="v">${esc(v.min_bond_display)}</div><div class="k">${term("bond", "minimum bond")}</div></div>
+    </div>
+    <div class="card learn"><h2>🧛 What validators do</h2>
+      <p>Validators take turns proposing blocks and vote to finalize them. A block is final once more than two-thirds of the active validators have signed it with ML-DSA-65, a post-quantum signature. There are no confirmations to wait for.</p>
+      <p>The set only changes between ${term("epoch", "epochs")} (every ${v.epoch_blocks} blocks). In Season 0, anyone can bond FANG and register, and an admin (${v.admins.map(who).join(", ")}) approves them. Approved validators join when the next epoch starts.</p></div><br>
+    ${list("Active this epoch", v.active, "—")}
+    ${list("Next epoch", v.next_epoch, "—")}
+    ${list("Waiting for approval", v.pending, "Nobody is waiting. Run <span class=\"mono\">blockula validator init</span> to become a validator.")}
+    ${v.approved.length ? list("Approved, joining soon", v.approved, "") : ""}
+    ${v.removed.length ? list("Removed", v.removed, "") : ""}
+    <div class="card"><h2>Admin actions</h2>${events.length ? events.map(([h, t]) => `<div class="row"><div>${t}</div><a class="dim" href="#/block/${h}">block #${h}</a></div>`).join("") : '<div class="dim">No changes since genesis.</div>'}</div>`;
 };
 
 function txRow(t) {

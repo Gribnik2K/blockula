@@ -3,28 +3,62 @@
 //   claude mcp add blockula -- npx -y @blockula/mcp
 //
 // Env:
-//   BLOCKULA_RPC       node URL (default http://localhost:7070)
-//   BLOCKULA_HOME      where the agent wallet lives (default ~/.blockula)
-//   BLOCKULA_MAX_SEND  max FANG per send() call (default 100) — a guardrail until on-chain session keys land
-//   BLOCKULA_BIN       path to the `blockula` binary (default: found on PATH)
+//   BLOCKULA_RPC        node URL (default: a local node on :7070 if one is running, else the public testnet)
+//   BLOCKULA_HOME       where the agent wallet lives (default ~/.blockula)
+//   BLOCKULA_MAX_SEND   max FANG per send() call (default 100)
+//   BLOCKULA_MAX_DAILY  max FANG this MCP sends per UTC day, across calls (default 100)
+//   BLOCKULA_BIN        path to the `blockula` binary (default: found on PATH)
+// When acting for a user's account via a session key, the chain also enforces that key's limit.
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { Client, Wallet, parseFang } from "@blockula/sdk";
+import { Client, Wallet, formatFang, parseFang } from "@blockula/sdk";
 import { spawn, execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 
-const RPC = process.env.BLOCKULA_RPC ?? "http://localhost:7070";
+const LOCAL_RPC = "http://localhost:7070";
+const TESTNET_RPC = "https://blockula-testnet.fly.dev";
 const HOME = process.env.BLOCKULA_HOME ?? join(homedir(), ".blockula");
 const WALLET_FILE = join(HOME, "agent-wallet.json");
 const MAX_SEND = parseFang(process.env.BLOCKULA_MAX_SEND ?? "100");
+const MAX_DAILY = parseFang(process.env.BLOCKULA_MAX_DAILY ?? "100");
+const SPEND_FILE = join(HOME, "agent-spend.json");
+const VERSION: string = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 const BIN = process.env.BLOCKULA_BIN ?? "blockula";
 
-const client = new Client(RPC);
-const server = new McpServer({ name: "blockula", version: "0.1.0" });
+async function reachable(url: string) {
+  try {
+    await new Client(url).status();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// No configuration needed: use a local node if one is running, otherwise the public testnet.
+let RPC = process.env.BLOCKULA_RPC ?? ((await reachable(LOCAL_RPC)) ? LOCAL_RPC : TESTNET_RPC);
+let client = new Client(RPC);
+function useRpc(url: string) {
+  RPC = url;
+  client = new Client(url);
+}
+
+/** Running total of FANG sent today (UTC), persisted so the cap holds across calls and restarts. */
+function spentToday(): { day: string; spent: bigint } {
+  const day = new Date().toISOString().slice(0, 10);
+  try {
+    const f = JSON.parse(readFileSync(SPEND_FILE, "utf8"));
+    if (f.day === day) return { day, spent: BigInt(f.spent) };
+  } catch {
+    /* no spend yet */
+  }
+  return { day, spent: 0n };
+}
+
+const server = new McpServer({ name: "blockula", version: VERSION });
 
 const text = (v: unknown) => ({ content: [{ type: "text" as const, text: typeof v === "string" ? v : JSON.stringify(v, null, 2) }] });
 
@@ -48,10 +82,6 @@ function requireWallet(): Wallet {
   return w;
 }
 
-async function nodeUp() {
-  try { await client.status(); return true; } catch { return false; }
-}
-
 function tool<S extends z.ZodRawShape>(name: string, description: string, shape: S, run: (args: z.infer<z.ZodObject<S>>) => Promise<unknown>) {
   server.registerTool(name, { description, inputSchema: shape }, (async (args: z.infer<z.ZodObject<S>>) => {
     try {
@@ -64,21 +94,45 @@ function tool<S extends z.ZodRawShape>(name: string, description: string, shape:
   }) as never);
 }
 
-tool("status", "Blockula network status: chain id, height, supply, fees burned, and the crypto in use.", {}, () => client.status());
+tool("status", "Blockula network status: which node you're connected to, chain id, height, supply, fees burned, and the crypto in use.", {}, async () => ({
+  rpc: RPC,
+  network: RPC === TESTNET_RPC ? "public testnet" : RPC === LOCAL_RPC ? "local node" : "custom node",
+  explorer: RPC,
+  mcp_version: VERSION,
+  ...(await client.status()),
+}));
 
-tool("start_dev_node", "Start a local Blockula dev chain (with faucet + built-in explorer) if one isn't already running. Requires the `blockula` binary.", { reset: z.boolean().optional().describe("wipe the dev chain first") }, async ({ reset }) => {
-  if (!reset && (await nodeUp())) return `Already running at ${RPC} (explorer: ${RPC})`;
-  const port = new URL(RPC).port || "7070";
+tool("tx_status", "Check a transaction by id: pending, finalized (with block), and its plain-English summary.", { tx_id: z.string().regex(/^[0-9a-f]{64}$/) }, async ({ tx_id }) => {
+  const tx = await client.tx(tx_id);
+  return { status: tx.status, summary: tx.summary, block: tx.height, fee: tx.fee_display, explorer: `${RPC}/#/tx/${tx_id}` };
+});
+
+tool("start_dev_node", "Start a local Blockula dev chain (faucet + built-in explorer) and switch to it. Needs the `blockula` binary; without it, keep using the public testnet, which supports everything except running your own chain.", { reset: z.boolean().optional().describe("wipe the dev chain first") }, async ({ reset }) => {
+  const target = process.env.BLOCKULA_RPC ?? LOCAL_RPC;
+  if (!reset && (await reachable(target))) {
+    useRpc(target);
+    return `Already running at ${target} (explorer: ${target})`;
+  }
+  const port = new URL(target).port || "7070";
   mkdirSync(HOME, { recursive: true });
   const log = openSync(join(HOME, "dev-node.log"), "a");
+  let missing = false;
   const child = spawn(BIN, ["dev", "--port", port, ...(reset ? ["--reset"] : [])], { detached: true, stdio: ["ignore", log, log] });
-  child.on("error", () => {});
+  child.on("error", (e: NodeJS.ErrnoException) => {
+    missing = e.code === "ENOENT";
+  });
   child.unref();
-  for (let i = 0; i < 40; i++) {
+  for (let i = 0; i < 40 && !missing; i++) {
     await new Promise((r) => setTimeout(r, 250));
-    if (await nodeUp()) return `🧛 Dev chain is up. Explorer: ${RPC} · logs: ${join(HOME, "dev-node.log")}`;
+    if (await reachable(target)) {
+      useRpc(target);
+      return `🧛 Dev chain is up. Explorer: ${target} · logs: ${join(HOME, "dev-node.log")}`;
+    }
   }
-  throw new Error(`node didn't start — is \`${BIN}\` installed? See ${join(HOME, "dev-node.log")}`);
+  if (missing) {
+    throw new Error(`The \`${BIN}\` node binary isn't installed, so a local chain can't start. You're connected to ${RPC}${RPC === TESTNET_RPC ? " (the public testnet)" : ""}, which works for wallets, the faucet, names and sends. To run your own chain, build the node from the Blockula repo (cargo build --release) and set BLOCKULA_BIN.`);
+  }
+  throw new Error(`node didn't start. See ${join(HOME, "dev-node.log")}`);
 });
 
 tool("summon_chain", "Create a brand-new Blockula chain (fresh genesis + validator key) that you can run as your own network.", { chain_id: z.string().regex(/^[a-z0-9-]{3,40}$/), faucet: z.boolean().default(true) }, async ({ chain_id, faucet }) => {
@@ -133,12 +187,19 @@ tool("wallet_info", "This agent's address, balance, .boo names and recent activi
 tool("faucet", "Get 100 test FANG on a dev/test chain (to this agent's wallet, or any name/address).", { to: z.string().optional() }, async ({ to }) => {
   const target = to ?? requireWallet().account;
   const tx = await client.faucet(target);
-  return tx.summary;
+  return { summary: tx.summary, tx_id: tx.id, explorer: `${RPC}/#/tx/${tx.id}` };
 });
 
 tool("send", "Send FANG to a .boo name or boo1… address. Amounts are in FANG, e.g. \"1.5\".", { to: z.string(), amount: z.string(), memo: z.string().max(256).optional() }, async ({ to, amount, memo }) => {
-  if (parseFang(amount) > MAX_SEND) throw new Error(`amount exceeds this agent's per-send limit (BLOCKULA_MAX_SEND=${process.env.BLOCKULA_MAX_SEND ?? "100"} FANG)`);
+  const drops = parseFang(amount);
+  if (drops > MAX_SEND) throw new Error(`amount exceeds this agent's per-send limit (BLOCKULA_MAX_SEND=${process.env.BLOCKULA_MAX_SEND ?? "100"} FANG)`);
+  const today = spentToday();
+  if (today.spent + drops > MAX_DAILY) {
+    throw new Error(`this would exceed the agent's daily limit (BLOCKULA_MAX_DAILY=${process.env.BLOCKULA_MAX_DAILY ?? "100"} FANG; ${formatFang(today.spent)} already sent today)`);
+  }
   const tx = await requireWallet().send(to, amount, { memo });
+  mkdirSync(HOME, { recursive: true });
+  writeFileSync(SPEND_FILE, JSON.stringify({ day: today.day, spent: (today.spent + drops + BigInt(tx.fee)).toString() }), { mode: 0o600 });
   return { summary: tx.summary, fee: tx.fee_display, tx_id: tx.id, block: tx.height, explorer: `${RPC}/#/tx/${tx.id}` };
 });
 

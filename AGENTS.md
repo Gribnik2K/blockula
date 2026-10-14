@@ -2,7 +2,7 @@
 
 ## Copy-paste prompt (for users)
 
-> Add Blockula to this project. Install the MCP server with `claude mcp add blockula -- npx -y @blockula/mcp`, call `start_dev_node`, then `create_wallet` and `faucet`. Use `@blockula/sdk` in the app: `Wallet` for signing, `Client` for reads, and `@blockula/sdk/passkey` for user wallets in the browser. Show balances and recipients by `.boo` name, never raw addresses.
+> Add Blockula to this project. Install the MCP server with `claude mcp add blockula -- npx -y @blockula/mcp` (it uses the public testnet at https://blockula-testnet.fly.dev unless a local node is running), then call `create_wallet` and `faucet`. Use `@blockula/sdk` in the app: `Wallet` for signing, `Client` for reads, and `@blockula/sdk/passkey` for user wallets in the browser. Show balances and recipients by `.boo` name, never raw addresses.
 
 ## Rules of the road
 
@@ -12,7 +12,7 @@
 - **User wallets = passkeys.** Use `createPasskeyWallet` / `unlockPasskeyWallet`. Never ask a user for a seed.
 - **Agent wallets = a local key** at `~/.blockula/agent-wallet.json` (mode 600). The right way to spend a user's money:
   1. `create_wallet` → give the user the `key_id`.
-  2. The user opens the web wallet → **Devices & agents → Give an agent a budget** (or calls `wallet.addSessionKey(keyId, label, { limit, periodBlocks, expiresInBlocks })`).
+  2. The user opens the web wallet (https://blockula-wallet.vercel.app) → **Devices & agents → Give an agent a budget** (or calls `wallet.addSessionKey(keyId, label, { limit, periodBlocks, expiresInBlocks })`).
   3. `use_account("theirname.boo")`. From then on, `send` spends from their account. **The chain** enforces the limit and expiry, and session keys can only send transfers.
   The MCP also caps each send at `BLOCKULA_MAX_SEND` (default 100 FANG).
 - **Accounts hold many keys.** `owner` keys (each passkey device, recovery keys) have full control. `session` keys are spend-limited. Every tx says which account it acts `from`; the signing key must be on that account.
@@ -23,16 +23,22 @@
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/status` | chain id, height, supply, burned |
+| GET | `/api/status` | chain id, height, supply, burned, version, git sha, genesis hash, epoch, sync state |
 | GET | `/api/blocks?limit=&before=` | recent blocks |
 | GET | `/api/block/{height\|hash}` | block + txs |
-| GET | `/api/tx/{id}` | tx with `summary`, `status` (`pending`/`finalized`) |
+| GET | `/api/tx/{id}` | tx with `summary`, `status` (`pending`/`finalized`/`failed` + `error`) |
 | POST | `/api/tx` | submit signed tx JSON |
 | GET | `/api/account/{address\|name}` | balance, `next_nonce`, names, recent txs |
 | GET | `/api/name/{name}` | availability + price, or owner |
 | GET | `/api/key/{key_id}` | accounts this key is authorized on |
 | GET | `/api/search/{q}` | `{type, id}` for anything |
-| POST | `/api/faucet` `{to}` | 100 FANG (dev chains) |
+| POST | `/api/faucet` `{to}` | 100 FANG on faucet chains (1 per address/hour, 1 per IP/10 min; unlimited from localhost) |
+| GET | `/api/validators` | epoch, blocks until the next one, active / next-epoch / pending / approved / removed validators, admins, min bond |
+| GET | `/api/genesis` | the chain's genesis.json |
+| GET | `/api/sync?from=&limit=` | finalized consensus blocks + a finalization certificate (served by every node; used by `blockula join`) |
+| GET | `/api/mempool?limit=` | pending txs |
+| GET | `/api/health` | 200 if the head is fresh and synced, else 503 + `reason` |
+| GET | `/metrics` | Prometheus: height, finalized lag, mempool, epoch, validators, faucet, tx counters |
 
 ## Working in this repo
 

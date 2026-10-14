@@ -1,0 +1,9 @@
+**/target
+**/node_modules
+**/.next
+**/dist
+web
+sdk-ts
+mcp
+.scratch-home
+.git

@@ -18,6 +18,8 @@ export function keyId(publicKey: Uint8Array): string {
 }
 
 export function isAddress(s: string): boolean {
+  // Addresses are canonical lowercase; the node rejects any other casing.
+  if (s !== s.toLowerCase()) return false;
   try {
     const { prefix, words } = bech32m.decode(s as `${string}1${string}`);
     return prefix === "boo" && bech32m.fromWords(words).length === 32;
@@ -95,7 +97,10 @@ export class Wallet {
 
   /** Send FANG to a `.boo` name or `boo1…` address. `amount` is in FANG ("1.5") or bigint drops. */
   async send(to: string, amount: string | number | bigint, opts: { memo?: string; wait?: boolean } = {}) {
-    const tx = await this.build({ type: "transfer", to, amount: parseFang(amount).toString() }, opts.memo);
+    // Sign the resolved address, not the name: what you checked is exactly who gets paid,
+    // even if the name changes hands before the block is sealed.
+    const recipient = await this.client.resolve(to);
+    const tx = await this.build({ type: "transfer", to: recipient, amount: parseFang(amount).toString() }, opts.memo);
     return this.client.submit(tx, opts.wait ?? true);
   }
 
@@ -114,6 +119,8 @@ export class Wallet {
    * Example: `addSessionKey(agentKeyId, "claude", { limit: "10", periodBlocks: 86_400, expiresInBlocks: 30 * 86_400 })`.
    */
   async addSessionKey(keyIdHex: string, label: string, opts: { limit: string | number | bigint; periodBlocks: number; expiresInBlocks: number }) {
+    if (!Number.isSafeInteger(opts.periodBlocks) || opts.periodBlocks < 1) throw new Error("periodBlocks must be a positive whole number of blocks");
+    if (!Number.isSafeInteger(opts.expiresInBlocks) || opts.expiresInBlocks < 1) throw new Error("expiresInBlocks must be a positive whole number of blocks");
     const { height } = await this.client.status();
     const role: KeyRole = { type: "session", limit: parseFang(opts.limit).toString(), period_blocks: opts.periodBlocks, expires_at: height + opts.expiresInBlocks };
     return this.client.submit(await this.build({ type: "add_key", key_id: keyIdHex, label, role }));
@@ -121,6 +128,29 @@ export class Wallet {
 
   async removeKey(keyIdHex: string) {
     return this.client.submit(await this.build({ type: "remove_key", key_id: keyIdHex }));
+  }
+
+  /**
+   * Offer a validator: bonds `bond` FANG from this account. `consensusKeyHex` is the validator
+   * node's ML-DSA-65 public key (see `blockula validator init`). Pending until an admin approves.
+   */
+  async registerValidator(opts: { consensusKey: string; p2pAddr: string; httpAddr: string; bond: string | number | bigint; pop: string }) {
+    return this.client.submit(await this.build({ type: "register_validator", consensus_key: opts.consensusKey, p2p_addr: opts.p2pAddr, http_addr: opts.httpAddr, bond: parseFang(opts.bond).toString(), pop: opts.pop }));
+  }
+
+  /** Season 0 admins only. */
+  async approveValidator(validator: string) {
+    return this.client.submit(await this.build({ type: "approve_validator", validator }));
+  }
+
+  /** Season 0 admins only. */
+  async removeValidator(validator: string) {
+    return this.client.submit(await this.build({ type: "remove_validator", validator }));
+  }
+
+  /** Reclaim the bond of a removed validator this account owns. */
+  async unbond(validator: string) {
+    return this.client.submit(await this.build({ type: "unbond", validator }));
   }
 
   balance() {
@@ -133,13 +163,35 @@ export class Wallet {
   }
 }
 
+/** An error response from a Blockula node. `status` is the HTTP status (429 = rate limited). */
+export class ApiError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+/** A transaction that was rejected at execution (fee charged) or dropped from the mempool. */
+export class TxFailedError extends Error {
+  constructor(readonly id: string, readonly reason: string, readonly tx: any) {
+    super(`tx ${id} failed: ${reason}`);
+    this.name = "TxFailedError";
+  }
+}
+
 export class Client {
   constructor(readonly rpc: string = DEFAULT_RPC) {}
 
   private async call(path: string, body?: unknown) {
     const res = await fetch(this.rpc.replace(/\/$/, "") + "/api" + path, body === undefined ? undefined : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-    const json = await res.json();
-    if (!res.ok) throw new Error(json.error ?? res.statusText);
+    const text = await res.text();
+    let json: any;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new ApiError(res.status, res.ok ? "the node returned something that isn't JSON" : `node error ${res.status} ${res.statusText}`.trim());
+    }
+    if (!res.ok) throw new ApiError(res.status, json.error ?? res.statusText);
     return json;
   }
 
@@ -152,9 +204,12 @@ export class Client {
   /** Accounts a key is authorized on (its own address, plus any it was added to). */
   keyAccounts(keyIdHex: string) { return this.call(`/key/${keyIdHex}`); }
   search(q: string) { return this.call(`/search/${encodeURIComponent(q)}`); }
+  /** Active set for the current epoch, pending/approved validators, next-epoch set, epoch timing. */
+  validators() { return this.call("/validators"); }
 
   async resolve(nameOrAddress: string): Promise<string> {
     if (isAddress(nameOrAddress)) return nameOrAddress;
+    if (/^boo1/i.test(nameOrAddress.trim())) throw new Error(`${nameOrAddress} isn't a valid address (check for typos; addresses are lowercase)`);
     const r = await this.name(nameOrAddress);
     if (r.available) throw new Error(`${r.name} isn't registered`);
     return r.owner.address;
@@ -175,6 +230,7 @@ export class Client {
     for (;;) {
       const tx = await this.tx(id);
       if (tx.status === "finalized") return tx;
+      if (tx.status === "failed") throw new TxFailedError(id, tx.error ?? "unknown reason", tx);
       if (Date.now() - start > timeoutMs) throw new Error(`tx ${id} still pending after ${timeoutMs}ms`);
       await new Promise((r) => setTimeout(r, 250));
     }

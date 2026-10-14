@@ -3,8 +3,8 @@ use crate::consensus::MarshalMailbox;
 use crate::crypto;
 use crate::types::*;
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -12,8 +12,10 @@ use axum::{
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub type Shared = Arc<Mutex<Chain>>;
 
@@ -23,23 +25,190 @@ pub struct Node {
     pub chain: Shared,
     /// Validators: marshal, to serve finalized blocks + certificates to joining nodes.
     pub marshal: Option<MarshalMailbox>,
-    /// Full nodes: validator HTTP endpoints that txs and faucet requests are forwarded to.
+    /// Full nodes (and validators without a faucet account): validator HTTP endpoints that txs
+    /// and faucet requests are forwarded to.
     pub peers: Vec<String>,
+    pub client_ip: ClientIpPolicy,
+    limits: Arc<Limits>,
+    pub stats: Arc<Stats>,
+    /// Extra Prometheus text (e.g. Commonware's runtime/p2p metrics on validators).
+    pub extra_metrics: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+}
+
+/// Counters for /metrics.
+#[derive(Default)]
+pub struct Stats {
+    pub tx_submitted: std::sync::atomic::AtomicU64,
+    pub tx_rejected: std::sync::atomic::AtomicU64,
+    pub faucet_drips: std::sync::atomic::AtomicU64,
+}
+
+fn bump(c: &std::sync::atomic::AtomicU64) {
+    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Rate-limit key for an IP: IPv6 clients are limited per /64 (one allocation), IPv4 per address.
+pub fn ip_key(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+    }
+}
+
+/// How to find a caller's IP for rate limits. Proxy headers are client-controlled unless a
+/// trusted proxy overwrites them, so each source must be enabled explicitly.
+#[derive(Clone, Default)]
+pub struct ClientIpPolicy {
+    /// Socket peers whose `X-Blockula-Client-IP` header is trusted (e.g. a full node on a LAN).
+    pub trusted_forwarders: Vec<IpAddr>,
+    /// Shared secret a forwarding full node sends in `X-Blockula-Forwarder-Key`; proves the
+    /// forwarder when its IP isn't stable (e.g. on Fly). Also sent by `forward()`.
+    pub forwarder_secret: Option<String>,
+    /// Header set by the reverse proxy in front of this node (`fly-client-ip`, `x-forwarded-for`).
+    /// Only enable it when every request comes through that proxy.
+    pub header: Option<String>,
+}
+
+impl std::fmt::Debug for ClientIpPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientIpPolicy")
+            .field("trusted_forwarders", &self.trusted_forwarders)
+            .field("forwarder_secret", &self.forwarder_secret.as_ref().map(|_| "<redacted>"))
+            .field("header", &self.header)
+            .finish()
+    }
+}
+
+impl ClientIpPolicy {
+    pub fn resolve(&self, peer: SocketAddr, h: &HeaderMap) -> Option<IpAddr> {
+        let header_ip = |name: &str| h.get(name).and_then(|v| v.to_str().ok()).and_then(|v| v.split(',').next()).and_then(|v| v.trim().parse::<IpAddr>().ok());
+        let policy = self;
+        let by_secret = match (&policy.forwarder_secret, h.get("x-blockula-forwarder-key")) {
+            (Some(secret), Some(given)) => ct_eq(secret.as_bytes(), given.as_bytes()),
+            _ => false,
+        };
+        if by_secret || policy.trusted_forwarders.contains(&peer.ip()) {
+            if let Some(ip) = header_ip("x-blockula-client-ip") {
+                return Some(ip);
+            }
+        }
+        if let Some(ip) = policy.header.as_deref().and_then(header_ip) {
+            return Some(ip);
+        }
+        if peer.ip().is_loopback() { None } else { Some(peer.ip()) }
+    }
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Sliding-window rate limits, in memory.
+#[derive(Default)]
+struct Limits {
+    hits: Mutex<HashMap<String, VecDeque<Instant>>>,
+}
+
+impl Limits {
+    /// Whether every `(key, max, window)` has room (nothing recorded).
+    fn check(&self, rules: &[(String, usize, Duration)]) -> Result<(), Duration> {
+        let now = Instant::now();
+        let mut hits = self.hits.lock();
+        for (key, max, window) in rules {
+            if let Some(q) = hits.get_mut(key) {
+                while q.front().is_some_and(|t| now.duration_since(*t) >= *window) {
+                    q.pop_front();
+                }
+                if q.len() >= *max {
+                    return Err(*window - now.duration_since(*q.front().unwrap()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Records a hit on each rule (after the action succeeded).
+    fn record(&self, rules: &[(String, usize, Duration)]) {
+        let now = Instant::now();
+        let mut hits = self.hits.lock();
+        for (key, _, _) in rules {
+            hits.entry(key.clone()).or_default().push_back(now);
+        }
+    }
+
+    /// Allows only if every `(key, max, window)` has room; then records a hit on each.
+    fn allow(&self, rules: &[(String, usize, Duration)]) -> Result<(), Duration> {
+        let now = Instant::now();
+        let mut hits = self.hits.lock();
+        if hits.len() > 100_000 {
+            hits.retain(|_, q| q.back().is_some_and(|t| now.duration_since(*t) < Duration::from_secs(3600)));
+        }
+        for (key, max, window) in rules {
+            let q = hits.entry(key.clone()).or_default();
+            while q.front().is_some_and(|t| now.duration_since(*t) >= *window) {
+                q.pop_front();
+            }
+            if q.len() >= *max {
+                return Err(*window - now.duration_since(*q.front().unwrap()));
+            }
+        }
+        for (key, _, _) in rules {
+            hits.get_mut(key).unwrap().push_back(now);
+        }
+        Ok(())
+    }
+}
+
+pub const TX_PER_IP_PER_MINUTE: usize = 120;
+pub const FAUCET_IP_WINDOW: Duration = Duration::from_secs(600);
+pub const FAUCET_ADDRESS_WINDOW: Duration = Duration::from_secs(3600);
+pub const MAX_BODY_BYTES: usize = 128 * 1024;
+
+fn too_many(what: &str, wait: Duration) -> ApiError {
+    let mins = wait.as_secs().div_ceil(60);
+    ApiError(StatusCode::TOO_MANY_REQUESTS, format!("{what}: try again in {mins} minute{}", if mins == 1 { "" } else { "s" }))
 }
 
 impl Node {
-    async fn forward(&self, path: &str, body: &Value) -> Result<Value, ApiError> {
-        let client = reqwest::Client::new();
+    pub fn new(chain: Shared, marshal: Option<MarshalMailbox>, peers: Vec<String>, client_ip: ClientIpPolicy) -> Self {
+        Self { chain, marshal, peers, client_ip, limits: Default::default(), stats: Default::default(), extra_metrics: None }
+    }
+
+    /// The client's IP for rate limiting, or `None` for local (loopback, un-proxied) callers.
+    /// Order: `X-Blockula-Client-IP` from an authenticated forwarder (secret or trusted socket
+    /// IP), then the configured proxy header, then the socket peer. Unconfigured headers are ignored.
+    fn client_ip(&self, peer: SocketAddr, h: &HeaderMap) -> Option<IpAddr> {
+        self.client_ip.resolve(peer, h)
+    }
+
+
+    async fn forward(&self, path: &str, body: &Value, client: Option<IpAddr>) -> Result<Value, ApiError> {
+        let http = reqwest::Client::builder().timeout(Duration::from_secs(15)).build().unwrap();
         let mut last = String::from("no peers configured");
         for peer in &self.peers {
-            match client.post(format!("{}/api{path}", peer.trim_end_matches('/'))).json(body).send().await {
+            let mut req = http.post(format!("{}/api{path}", peer.trim_end_matches('/'))).json(body).header(FORWARDED_HEADER, "1");
+            if let Some(ip) = client {
+                req = req.header("x-blockula-client-ip", ip.to_string());
+            }
+            if let Some(secret) = &self.client_ip.forwarder_secret {
+                req = req.header("x-blockula-forwarder-key", secret);
+            }
+            match req.send().await {
                 Ok(res) => {
+                    let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                     let ok = res.status().is_success();
                     let v: Value = res.json().await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e.to_string()))?;
                     if ok {
                         return Ok(v);
                     }
-                    return Err(ApiError(StatusCode::BAD_REQUEST, v["error"].as_str().unwrap_or("peer rejected the request").to_string()));
+                    let code = if status.is_client_error() || status == StatusCode::SERVICE_UNAVAILABLE { status } else { StatusCode::BAD_GATEWAY };
+                    return Err(ApiError(code, v["error"].as_str().unwrap_or("peer rejected the request").to_string()));
                 }
                 Err(e) => last = e.to_string(),
             }
@@ -49,6 +218,20 @@ impl Node {
 }
 
 const EXPLORER: &str = include_str!("explorer.html");
+
+/// Set on requests a node forwards to another; a forwarded request is never forwarded again
+/// (so misconfigured peers — e.g. a node listed as its own peer — can't loop).
+pub const FORWARDED_HEADER: &str = "x-blockula-forwarded";
+
+fn forwarded(h: &HeaderMap) -> bool {
+    h.contains_key(FORWARDED_HEADER)
+}
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const GIT_SHA: &str = match option_env!("BLOCKULA_GIT_SHA") {
+    Some(s) => s,
+    None => "unknown",
+};
 
 struct ApiError(StatusCode, String);
 
@@ -85,28 +268,42 @@ pub fn router(node: Node) -> Router {
         .route("/api/faucet", post(faucet))
         .route("/api/genesis", get(genesis))
         .route("/api/sync", get(sync))
+        .route("/api/validators", get(validators))
+        .route("/api/mempool", get(mempool))
+        .route("/api/health", get(health))
+        .route("/metrics", get(metrics))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(node)
 }
 
 fn label(c: &Chain, addr: &str) -> Value {
-    let name = if addr == treasury() { Some("🏛️ treasury".to_string()) } else if c.genesis.is_validator(addr) { c.state.primary_name(addr).or(Some("🧛 validator".into())) } else { c.state.primary_name(addr) };
+    let name = if addr == treasury() { Some("🏛️ treasury".to_string()) } else if c.state.validators.get(addr).is_some_and(|v| v.status == crate::chain::ValidatorStatus::Active) { c.state.primary_name(addr).or(Some("🧛 validator".into())) } else { c.state.primary_name(addr) };
     json!({ "address": addr, "name": name, "short": short(addr) })
 }
 
 fn tx_json(c: &Chain, tx: &Tx, height: Option<u64>) -> Value {
+    tx_json_with(c, tx, height, None)
+}
+
+fn tx_json_with(c: &Chain, tx: &Tx, height: Option<u64>, error: Option<&str>) -> Value {
     let sender = tx.sender().unwrap_or_default();
     let (kind, to, amount) = match &tx.action {
         Action::Transfer { to, amount } => ("transfer", c.state.resolve(to).ok(), Some(*amount)),
         Action::RegisterName { .. } => ("register_name", None, None),
         Action::AddKey { .. } => ("add_key", None, None),
         Action::RemoveKey { .. } => ("remove_key", None, None),
+        Action::RegisterValidator { bond, .. } => ("register_validator", None, Some(*bond)),
+        Action::ApproveValidator { .. } => ("approve_validator", None, None),
+        Action::RemoveValidator { .. } => ("remove_validator", None, None),
+        Action::Unbond { .. } => ("unbond", None, None),
     };
     json!({
         "id": tx.id(),
-        "summary": c.state.describe(tx),
+        "summary": c.state.describe(tx, height),
         "kind": kind,
-        "status": if height.is_some() { "finalized" } else { "pending" },
+        "status": match (height, error) { (_, Some(_)) => "failed", (Some(_), None) => "finalized", (None, None) => "pending" },
+        "error": error,
         "height": height,
         "from": label(c, &sender),
         "to": to.map(|t| label(c, &t)),
@@ -135,8 +332,9 @@ fn block_json(c: &Chain, b: &Block, full: bool) -> Value {
         "summary": format!("Block #{} sealed with {} transaction{}", b.height, b.txs.len(), if b.txs.len() == 1 { "" } else { "s" }),
     });
     if full {
-        v["txs"] = b.txs.iter().map(|t| tx_json(c, t, Some(b.height))).collect();
-        v["signature_bytes"] = json!(b.signature.len() / 2);
+        v["txs"] = b.txs.iter().enumerate().map(|(i, t)| tx_json_with(c, t, Some(b.height), b.failed.get(&i).map(|s| s.as_str()))).collect();
+        v["signature_bytes"] = json!(c.cert_len(b.height));
+        v["failed_count"] = json!(b.failed.len());
     }
     v
 }
@@ -150,13 +348,15 @@ async fn status(State(n): State<Node>) -> ApiResult {
         "height": c.height(),
         "block_time_ms": c.genesis.block_time_ms,
         "validator": label(&c, &c.genesis.validators[0].address),
-        "validators": c.genesis.validators.iter().map(|v| label(&c, &v.address)).collect::<Vec<_>>(),
+        "validators": c.state.active_sets.get(&c.state.params.epoch_of(c.height() + 1)).map(|s| s.iter().map(|a| label(&c, a)).collect::<Vec<_>>()).unwrap_or_default(),
         "role": c.role,
         "finalized_height": c.finalized_tip.max(c.height()),
         "syncing": c.height() < c.finalized_tip,
         "sync_progress": if c.finalized_tip == 0 { 1.0 } else { (c.height() as f64 / c.finalized_tip as f64).min(1.0) },
         "state_root": c.state.root(),
-        "consensus": if c.genesis.validators.len() == 1 { "simplex BFT (single validator)" } else { "simplex BFT" },
+        "consensus": "simplex BFT",
+        "epoch": c.state.params.epoch_of(c.height() + 1),
+        "active_validators": c.state.active_sets.get(&c.state.params.epoch_of(c.height() + 1)).map(|s| s.len()).unwrap_or(0),
         "faucet": c.genesis.faucet,
         "supply": c.state.supply.to_string(),
         "supply_display": fmt_fang(c.state.supply),
@@ -165,7 +365,10 @@ async fn status(State(n): State<Node>) -> ApiResult {
         "accounts": c.state.accounts.len(),
         "names": c.state.names.len(),
         "mempool": c.mempool.len(),
-        "data_dir": c.home.display().to_string(),
+        "version": VERSION,
+        "git_sha": GIT_SHA,
+        "genesis_hash": c.genesis_hash,
+        "head_age_ms": c.last_block().map(|b| crate::chain::now_ms().saturating_sub(b.timestamp_ms)),
         "crypto": { "signatures": "ML-DSA-65 (FIPS 204)", "hash": "BLAKE3-256", "addresses": "bech32m(boo, BLAKE3(pubkey))", "p2p_transport": "X25519 + ChaCha20-Poly1305 (not post-quantum), ML-DSA-65 peer auth" },
     })))
 }
@@ -180,50 +383,148 @@ async fn blocks(State(n): State<Node>, Query(p): Query<Page>) -> ApiResult {
     let c = n.chain.lock();
     let limit = p.limit.unwrap_or(20).min(100);
     let before = p.before.unwrap_or(u64::MAX);
-    let out: Vec<Value> = c.blocks.iter().rev().filter(|b| b.height < before).take(limit).map(|b| block_json(&c, b, false)).collect();
+    let out: Vec<Value> = c.blocks_before(before, limit).iter().map(|b| block_json(&c, b, false)).collect();
     Ok(Json(json!(out)))
 }
 
-fn find_block<'a>(c: &'a Chain, id: &str) -> Option<&'a Block> {
+fn find_block(c: &Chain, id: &str) -> Option<Block> {
     match id.parse::<u64>() {
-        Ok(h) if h >= 1 => c.blocks.get(h as usize - 1),
-        _ => c.blocks.iter().find(|b| b.hash == id),
+        Ok(h) if h >= 1 => c.block(h),
+        _ => c.block_by_hash(id),
     }
+}
+
+/// A finalized tx and its failure reason, if any.
+fn finalized_tx(c: &Chain, h: u64, i: usize) -> Option<(Tx, Option<String>)> {
+    let b = c.block(h)?;
+    let err = b.failed.get(&i).cloned();
+    b.txs.into_iter().nth(i).map(|t| (t, err))
 }
 
 async fn block(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
     let c = n.chain.lock();
     let b = find_block(&c, &id).ok_or_else(|| not_found("block"))?;
-    Ok(Json(block_json(&c, b, true)))
+    Ok(Json(block_json(&c, &b, true)))
 }
 
 async fn tx(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
     let c = n.chain.lock();
     if let Some(&(h, i)) = c.tx_index.get(&id) {
-        return Ok(Json(tx_json(&c, &c.blocks[h as usize - 1].txs[i], Some(h))));
+        if let Some((t, err)) = finalized_tx(&c, h, i) {
+            return Ok(Json(tx_json_with(&c, &t, Some(h), err.as_deref())));
+        }
     }
-    let pending = c.mempool.iter().find(|t| t.id() == id).ok_or_else(|| not_found("transaction"))?;
-    Ok(Json(tx_json(&c, pending, None)))
+    if c.in_mempool(&id) {
+        if let Some(pending) = c.mempool.iter().find(|t| t.id() == id) {
+            return Ok(Json(tx_json(&c, pending, None)));
+        }
+    }
+    if let Some((reason, height)) = c.failure(&id) {
+        return Ok(Json(json!({ "id": id, "status": "failed", "error": reason, "height": height, "summary": format!("Transaction failed: {reason}") })));
+    }
+    Err(not_found("transaction"))
 }
 
-async fn submit(State(n): State<Node>, Json(tx): Json<Tx>) -> ApiResult {
-    if n.chain.lock().role == Role::FullNode {
-        // Check locally first for a good error, then hand it to a validator.
-        {
-            let c = n.chain.lock();
-            let mut scratch = c.state.clone();
-            for q in &c.mempool {
-                let _ = scratch.apply(q, &c.genesis.chain_id, &c.genesis.validators[0].address, c.height() + 1);
-            }
-            scratch.apply(&tx, &c.genesis.chain_id, &c.genesis.validators[0].address, c.height() + 1)?;
+async fn submit(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Json(tx): Json<Tx>) -> ApiResult {
+    let client = n.client_ip(peer, &headers);
+    if let Some(ip) = client {
+        n.limits.allow(&[(format!("tx:{}", ip_key(ip)), TX_PER_IP_PER_MINUTE, Duration::from_secs(60))]).map_err(|w| too_many("too many transactions from your IP", w))?;
+    }
+    let result = submit_inner(&n, &headers, client, tx).await;
+    bump(if result.is_ok() { &n.stats.tx_submitted } else { &n.stats.tx_rejected });
+    result
+}
+
+async fn submit_inner(n: &Node, headers: &HeaderMap, client: Option<IpAddr>, tx: Tx) -> ApiResult {
+    // Format + ML-DSA signature checks run without holding the chain lock.
+    let (chain_id, role) = {
+        let c = n.chain.lock();
+        (c.genesis.chain_id.clone(), c.role)
+    };
+    crate::consensus::check_tx_stateless(&tx, &chain_id)?;
+    if role == Role::FullNode {
+        if forwarded(headers) {
+            return Err(ApiError(StatusCode::LOOP_DETECTED, "forwarding loop: this full node was sent a forwarded tx".into()));
         }
-        n.forward("/tx", &serde_json::to_value(&tx).unwrap()).await?;
-        let id = tx.id();
-        n.chain.lock().track_pending(tx);
+        // Admit locally (same checks as a validator), then hand it to a validator.
+        let id = n.chain.lock().submit(tx.clone())?;
+        if let Err(e) = n.forward("/tx", &serde_json::to_value(&tx).unwrap(), client).await {
+            n.chain.lock().drop_pending(&id);
+            return Err(e);
+        }
         return Ok(Json(json!({ "id": id, "status": "pending" })));
     }
     let id = n.chain.lock().submit(tx)?;
     Ok(Json(json!({ "id": id, "status": "pending" })))
+}
+
+/// Pending transactions (newest first).
+async fn mempool(State(n): State<Node>, Query(p): Query<Page>) -> ApiResult {
+    let c = n.chain.lock();
+    let limit = p.limit.unwrap_or(50).min(200);
+    let txs: Vec<Value> = c.mempool.iter().rev().take(limit).map(|t| tx_json(&c, t, None)).collect();
+    Ok(Json(json!({ "count": c.mempool.len(), "txs": txs })))
+}
+
+/// 200 when the head is fresh and we're not syncing; 503 with a reason otherwise.
+async fn health(State(n): State<Node>) -> Response {
+    let c = n.chain.lock();
+    let bt = c.genesis.block_time_ms.max(1);
+    let age = c.last_block().map(|b| crate::chain::now_ms().saturating_sub(b.timestamp_ms));
+    let syncing = c.height() < c.finalized_tip;
+    let reason = match age {
+        _ if syncing => Some(format!("syncing: {} of {}", c.height(), c.finalized_tip)),
+        None => Some("no blocks yet".to_string()),
+        Some(a) if a > 10 * bt => Some(format!("head is {}s old", a / 1000)),
+        _ => None,
+    };
+    let body = json!({ "ok": reason.is_none(), "reason": reason, "height": c.height(), "head_age_ms": age, "finalized_height": c.finalized_tip.max(c.height()) });
+    let code = if reason.is_none() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (code, Json(body)).into_response()
+}
+
+/// Prometheus text format.
+async fn metrics(State(n): State<Node>) -> Response {
+    use std::fmt::Write as _;
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut out = String::new();
+    {
+        let c = n.chain.lock();
+        let epoch = c.state.params.epoch_of(c.height() + 1);
+        let active = c.state.active_sets.get(&epoch).map(|s| s.len()).unwrap_or(0);
+        let head_age = c.last_block().map(|b| crate::chain::now_ms().saturating_sub(b.timestamp_ms)).unwrap_or(0);
+        let online = online_validators(&c);
+        for (name, help, v) in [
+            ("blockula_height", "Executed height", c.height() as f64),
+            ("blockula_finalized_height", "Highest certified finalized height", c.finalized_tip.max(c.height()) as f64),
+            ("blockula_finalized_lag", "Finalized height minus executed height", c.finalized_tip.saturating_sub(c.height()) as f64),
+            ("blockula_head_age_seconds", "Seconds since the head block's timestamp", head_age as f64 / 1000.0),
+            ("blockula_mempool_size", "Pending transactions", c.mempool.len() as f64),
+            ("blockula_epoch", "Current epoch", epoch as f64),
+            ("blockula_active_validators", "Validators in the active set", active as f64),
+            ("blockula_validators_online", "Signers on the latest finalization certificate", online.map(|o| o as f64).unwrap_or(f64::NAN)),
+            ("blockula_faucet_drips_total", "Faucet drips served", n.stats.faucet_drips.load(Relaxed) as f64),
+            ("blockula_tx_submitted_total", "Transactions accepted over HTTP", n.stats.tx_submitted.load(Relaxed) as f64),
+            ("blockula_tx_rejected_total", "Transactions rejected over HTTP", n.stats.tx_rejected.load(Relaxed) as f64),
+        ] {
+            let kind = if name.ends_with("_total") { "counter" } else { "gauge" };
+            let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {v}");
+        }
+        let _ = writeln!(out, "# HELP blockula_build_info Version and git sha\n# TYPE blockula_build_info gauge\nblockula_build_info{{version=\"{VERSION}\",git_sha=\"{GIT_SHA}\"}} 1");
+    }
+    if let Some(extra) = &n.extra_metrics {
+        out.push_str(&extra());
+    }
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response()
+}
+
+/// How many validators signed the most recent finalization certificate we hold.
+pub fn online_validators(c: &Chain) -> Option<usize> {
+    use commonware_codec::Decode as _;
+    let h = (c.height().saturating_sub(16)..=c.height()).rev().find(|h| c.cert_len(*h) > 0)?;
+    let bytes = c.cert(h)?;
+    let f = commonware_consensus::simplex::types::Finalization::<crate::pq::MlDsaScheme, commonware_cryptography::blake3::Digest>::decode_cfg(bytes.as_slice(), &1024usize).ok()?;
+    Some(f.certificate.signers.count())
 }
 
 async fn account(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
@@ -231,9 +532,16 @@ async fn account(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
     let addr = c.state.resolve(&id)?;
     let acct = c.state.account(&addr);
     let names: Vec<String> = c.state.names.values().filter(|r| r.owner == addr).map(|r| format!("{}{NAME_SUFFIX}", r.name)).collect();
-    let recent: Vec<Value> = c.history.get(&addr).map(|ids| {
-        ids.iter().rev().take(25).filter_map(|id| c.tx_index.get(id)).map(|&(h, i)| tx_json(&c, &c.blocks[h as usize - 1].txs[i], Some(h))).collect()
-    }).unwrap_or_default();
+    let mut recent: Vec<Value> = c
+        .mempool
+        .iter()
+        .filter(|t| t.from == addr || matches!(&t.action, Action::Transfer { to, .. } if c.state.resolve(to).ok().as_deref() == Some(addr.as_str())))
+        .rev()
+        .map(|t| tx_json(&c, t, None))
+        .collect();
+    recent.extend(c.history.get(&addr).map(|ids| {
+        ids.iter().rev().take(25).filter_map(|id| c.tx_index.get(id)).filter_map(|&(h, i)| finalized_tx(&c, h, i).map(|(t, e)| tx_json_with(&c, &t, Some(h), e.as_deref()))).collect::<Vec<_>>()
+    }).unwrap_or_default());
     Ok(Json(json!({
         "account": label(&c, &addr),
         "balance": acct.balance.to_string(),
@@ -276,7 +584,7 @@ async fn search(State(n): State<Node>, Path(q): Path<String>) -> ApiResult {
     let q = q.trim().to_lowercase();
     let hit = if find_block(&c, &q).is_some() {
         json!({ "type": "block", "id": q })
-    } else if c.tx_index.contains_key(&q) || c.mempool.iter().any(|t| t.id() == q) {
+    } else if c.tx_index.contains_key(&q) || c.in_mempool(&q) || c.failure(&q).is_some() {
         json!({ "type": "tx", "id": q })
     } else if crypto::is_address(&q) {
         json!({ "type": "account", "id": q })
@@ -288,23 +596,109 @@ async fn search(State(n): State<Node>, Path(q): Path<String>) -> ApiResult {
     Ok(Json(hit))
 }
 
-async fn faucet(State(n): State<Node>, Json(body): Json<HashMap<String, String>>) -> ApiResult {
+async fn faucet(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Json(body): Json<HashMap<String, String>>) -> ApiResult {
     let to = body.get("to").ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "missing `to`".into()))?.clone();
     let to = &to;
-    let role = n.chain.lock().role;
-    if role == Role::FullNode {
-        let v = n.forward("/faucet", &json!({ "to": to })).await?;
-        if let Ok(tx) = serde_json::from_value::<Tx>(v["tx"].clone()) {
-            n.chain.lock().track_pending(tx);
-        }
-        return Ok(Json(v));
+    let (faucet_here, resolved, enabled, busy) = {
+        let c = n.chain.lock();
+        let here = c.me().is_some_and(|me| c.genesis.is_validator(&me));
+        (here, c.state.resolve(to)?, c.genesis.faucet, here && c.faucet_busy())
+    };
+    if !enabled {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "this chain has no faucet".into()));
     }
-    let tx = n.chain.lock().faucet(to, 100 * DROPS_PER_FANG)?;
-    Ok(Json(json!({ "id": tx.id(), "amount_display": "100 FANG", "tx": tx })))
+    if busy {
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "faucet busy, retry in a few seconds".into()));
+    }
+    let client = n.client_ip(peer, &headers);
+    let mut rules = vec![(format!("faucet-addr:{resolved}"), 1, FAUCET_ADDRESS_WINDOW)];
+    if let Some(ip) = client {
+        rules.push((format!("faucet-ip:{}", ip_key(ip)), 1, FAUCET_IP_WINDOW));
+    }
+    // Loopback callers (local dev, tests) aren't limited at all.
+    let limited = client.is_some() || !peer.ip().is_loopback();
+    if limited {
+        n.limits.check(&rules).map_err(|w| too_many("the faucet already dripped for you", w))?;
+    }
+    // Quota is only consumed once the drip actually went out.
+    let v = if !faucet_here {
+        if forwarded(&headers) {
+            return Err(ApiError(StatusCode::LOOP_DETECTED, "forwarding loop: no faucet here".into()));
+        }
+        let v = n.forward("/faucet", &json!({ "to": to }), client).await?;
+        if let Ok(tx) = serde_json::from_value::<Tx>(v["tx"].clone()) {
+            let _ = n.chain.lock().track_pending(tx);
+        }
+        v
+    } else {
+        let tx = n.chain.lock().faucet(to, 100 * DROPS_PER_FANG).map_err(|e| {
+            let msg = e.to_string();
+            ApiError(if msg.contains("faucet busy") { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::BAD_REQUEST }, msg)
+        })?;
+        json!({ "id": tx.id(), "amount_display": "100 FANG", "tx": tx })
+    };
+    if limited {
+        n.limits.record(&rules);
+    }
+    bump(&n.stats.faucet_drips);
+    Ok(Json(v))
+}
+
+fn validator_json(c: &Chain, v: &crate::chain::ValidatorRecord) -> Value {
+    json!({
+        "validator": label(c, &v.address),
+        "owner": label(c, &v.owner),
+        "status": v.status,
+        "consensus_key": v.consensus_key,
+        "p2p_addr": v.p2p_addr,
+        "http_addr": v.http_addr,
+        "bond": v.bond.to_string(),
+        "bond_display": fmt_fang(v.bond),
+        "registered_at": v.registered_at,
+        "approved_at": v.approved_at,
+        "approved_by": v.approved_by.as_ref().map(|a| label(c, a)),
+        "active_from_epoch": v.active_from,
+        "removed_at": v.removed_at,
+        "removed_by": v.removed_by.as_ref().map(|a| label(c, a)),
+        "active_until_epoch": v.active_until,
+        "unbond_epoch": v.unbond_epoch,
+        "genesis": c.genesis.is_validator(&v.address),
+    })
+}
+
+/// The validator set: who's active this epoch, who's next, who's waiting, and when it changes.
+async fn validators(State(n): State<Node>) -> ApiResult {
+    use crate::chain::ValidatorStatus::*;
+    let c = n.chain.lock();
+    let p = &c.state.params;
+    let next_height = c.height() + 1;
+    let epoch = p.epoch_of(next_height);
+    let ids = |set: Option<&Vec<String>>| -> Vec<Value> { set.map(|s| s.iter().filter_map(|a| c.state.validators.get(a)).map(|v| validator_json(&c, v)).collect()).unwrap_or_default() };
+    let by_status = |st: crate::chain::ValidatorStatus| -> Vec<Value> { c.state.validators.values().filter(|v| v.status == st).map(|v| validator_json(&c, v)).collect() };
+    let next_set = c.state.next_set(epoch);
+    Ok(Json(json!({
+        "epoch": epoch,
+        "epoch_blocks": p.epoch_blocks,
+        "epoch_ends_at_height": p.last_of(epoch),
+        "blocks_until_next_epoch": p.last_of(epoch) + 1 - next_height,
+        "active": ids(c.state.active_sets.get(&epoch)),
+        "next_epoch": ids(Some(&next_set)),
+        "pending": by_status(Pending),
+        "approved": by_status(Approved),
+        "removed": by_status(Removed),
+        "admins": p.admins.iter().map(|a| label(&c, a)).collect::<Vec<_>>(),
+        "min_bond": p.min_bond.to_string(),
+        "min_bond_display": fmt_fang(p.min_bond),
+        "max_validators": p.max_validators,
+        "explainer": "Validators take turns proposing blocks and vote to finalize them; a block is final once more than two-thirds of the active set have signed it (ML-DSA-65). The set can only change at epoch boundaries. In Season 0, admins approve new validators, who post a bond and join at the next epoch.",
+    })))
 }
 
 async fn genesis(State(n): State<Node>) -> ApiResult {
-    Ok(Json(serde_json::to_value(&n.chain.lock().genesis).unwrap()))
+    let c = n.chain.lock();
+    let mut v = serde_json::to_value(&c.genesis).unwrap();
+    v["genesis_hash"] = json!(c.genesis_hash);
+    Ok(Json(v))
 }
 
 #[derive(Deserialize)]
@@ -315,41 +709,213 @@ struct SyncQuery {
 
 /// Finalized consensus blocks `[from, to]` plus the finalization certificate of block `to`, so a
 /// joining node can verify the whole batch (hash links + one ML-DSA quorum certificate).
+/// Bytes of block data per `/api/sync` response (the joiner caps what it reads, too).
+pub const SYNC_BATCH_BYTES: usize = 8 << 20;
+
+/// Finalized consensus blocks `[from, to]` plus the finalization certificate of block `to`, so a
+/// joining node can verify the whole batch (hash links + one ML-DSA quorum certificate).
+/// Served by validators and full nodes from their own block/certificate stores.
 async fn sync(State(n): State<Node>, Query(q): Query<SyncQuery>) -> ApiResult {
     use commonware_codec::Encode;
     use commonware_consensus::types::Height;
-    let marshal = n.marshal.clone().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "only validators serve sync".into()))?;
-    let tip = n.chain.lock().height();
-    let from = q.from.max(1);
+    let (tip, from, range_end) = {
+        let c = n.chain.lock();
+        let from = q.from.max(1);
+        let epoch_end = c.state.params.last_of(c.state.params.epoch_of(from));
+        (c.height(), from, c.height().min(epoch_end)) // never mix epochs (different validator sets)
+    };
     if from > tip {
         return Ok(Json(json!({ "tip": tip, "blocks": [], "to": null, "finalization": null })));
     }
-    let to = (from + q.limit.unwrap_or(100).clamp(1, 500) - 1).min(tip);
-    // Find the highest height in range that has a stored finalization (normally `to` itself).
-    let mut cert_height = None;
-    let mut h = to;
-    while h >= from {
-        if let Some(f) = marshal.get_finalization(Height::new(h)).await {
-            cert_height = Some((h, hex::encode(f.encode())));
-            break;
-        }
-        h -= 1;
-    }
-    if cert_height.is_none() {
-        for h in to + 1..=tip.min(to + 64) {
-            if let Some(f) = marshal.get_finalization(Height::new(h)).await {
-                cert_height = Some((h, hex::encode(f.encode())));
+    let want = (from + q.limit.unwrap_or(100).clamp(1, 500) - 1).min(range_end);
+    // Blocks up to `want`, cut at the byte budget, and the highest certified height among them.
+    let (mut blocks, mut cert) = (vec![], None);
+    let mut bytes = 0usize;
+    let mut last_cert_len = 0usize;
+    {
+        let c = n.chain.lock();
+        for h in from..=want {
+            let Some(b) = c.cblock(h) else { break };
+            bytes += b.len() * 2;
+            if bytes > SYNC_BATCH_BYTES && !blocks.is_empty() {
                 break;
+            }
+            blocks.push(hex::encode(&b));
+            if let Some(f) = c.cert(h) {
+                cert = Some((h, hex::encode(f)));
+                last_cert_len = blocks.len();
+            }
+        }
+        // No certificate in range: extend to the next certified height (still within the epoch).
+        if cert.is_none() && bytes <= SYNC_BATCH_BYTES {
+            let mut h = from + blocks.len() as u64;
+            while h <= range_end && h < from + 600 {
+                let Some(b) = c.cblock(h) else { break };
+                blocks.push(hex::encode(&b));
+                if let Some(f) = c.cert(h) {
+                    cert = Some((h, hex::encode(f)));
+                    last_cert_len = blocks.len();
+                    break;
+                }
+                h += 1;
             }
         }
     }
-    let Some((to, finalization)) = cert_height else {
-        return Ok(Json(json!({ "tip": tip, "blocks": [], "to": null, "finalization": null })));
-    };
-    let mut blocks = vec![];
-    for h in from..=to {
-        let b = marshal.get_block(Height::new(h)).await.ok_or_else(|| not_found("block"))?;
-        blocks.push(hex::encode(b.encode()));
+    // Validators can fall back to marshal's archive for the certificate.
+    if cert.is_none() {
+        if let Some(m) = &n.marshal {
+            for i in (0..blocks.len()).rev().take(64) {
+                let h = from + i as u64;
+                if let Some(f) = m.get_finalization(Height::new(h)).await {
+                    cert = Some((h, hex::encode(f.encode())));
+                    last_cert_len = i + 1;
+                    break;
+                }
+            }
+        }
     }
+    let Some((to, finalization)) = cert else {
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, format!("no finalization certificate stored for heights {from}..={range_end}; try another peer")));
+    };
+    blocks.truncate(last_cert_len);
     Ok(Json(json!({ "tip": tip, "blocks": blocks, "to": to, "finalization": finalization })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(*k, v.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn client_ip_headers_are_only_trusted_when_configured() {
+        let peer: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        let spoof = headers(&[("fly-client-ip", "1.2.3.4"), ("x-forwarded-for", "5.6.7.8"), ("x-blockula-client-ip", "9.9.9.9")]);
+        // Default: proxy and forwarder headers are ignored.
+        assert_eq!(ClientIpPolicy::default().resolve(peer, &spoof), Some(peer.ip()));
+        // Behind Fly: only the configured header counts.
+        let fly = ClientIpPolicy { header: Some("fly-client-ip".into()), ..Default::default() };
+        assert_eq!(fly.resolve(peer, &spoof), Some("1.2.3.4".parse().unwrap()));
+        // Forwarder secret: wrong key is ignored, right key is honored.
+        let secret = ClientIpPolicy { forwarder_secret: Some("s".repeat(32)), ..Default::default() };
+        let wrong = headers(&[("x-blockula-forwarder-key", "nope"), ("x-blockula-client-ip", "9.9.9.9")]);
+        assert_eq!(secret.resolve(peer, &wrong), Some(peer.ip()));
+        let right = headers(&[("x-blockula-forwarder-key", &"s".repeat(32)), ("x-blockula-client-ip", "9.9.9.9")]);
+        assert_eq!(secret.resolve(peer, &right), Some("9.9.9.9".parse().unwrap()));
+        // A spoofed Fly header can't impersonate a trusted forwarder IP.
+        let lan = ClientIpPolicy { trusted_forwarders: vec!["10.0.0.2".parse().unwrap()], ..Default::default() };
+        let fake = headers(&[("fly-client-ip", "10.0.0.2"), ("x-blockula-client-ip", "9.9.9.9")]);
+        assert_eq!(lan.resolve(peer, &fake), Some(peer.ip()));
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use crate::chain::SummonOpts;
+    use axum::body::Body;
+    use axum::extract::connect_info::MockConnectInfo;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    fn node(tag: &str) -> (std::path::PathBuf, Node) {
+        let root = std::env::temp_dir().join(format!("blockula-api-{tag}-{}-{}", crate::chain::now_ms(), std::process::id()));
+        let homes = Chain::summon(&root, &SummonOpts::new(tag, 1)).unwrap();
+        let chain = Arc::new(Mutex::new(Chain::open(&homes[0]).unwrap()));
+        (root, Node::new(chain, None, vec![], ClientIpPolicy::default()))
+    }
+
+    async fn call(n: &Node, method: &str, uri: &str, body: Option<Value>, peer: &str) -> (StatusCode, Value, String) {
+        let app = router(n.clone()).layer(MockConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        let req = Request::builder().method(method).uri(uri).header("content-type", "application/json");
+        let req = req.body(body.map(|b| Body::from(b.to_string())).unwrap_or_else(Body::empty)).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        (status, serde_json::from_str(&text).unwrap_or(Value::Null), text)
+    }
+
+    #[tokio::test]
+    async fn status_health_metrics_genesis_and_sync() {
+        let (root, n) = node("ops");
+        let (s, status, _) = call(&n, "GET", "/api/status", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(status.get("data_dir").is_none(), "data_dir isn't exposed");
+        assert_eq!(status["version"], VERSION);
+        assert!(status["genesis_hash"].as_str().unwrap().len() == 64);
+        // No blocks yet: unhealthy.
+        let (s, h, _) = call(&n, "GET", "/api/health", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(h["reason"].as_str().is_some());
+        n.chain.lock().produce_block_with(vec![]).unwrap();
+        let (s, _, _) = call(&n, "GET", "/api/health", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _, text) = call(&n, "GET", "/metrics", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(text.contains("blockula_height 1") && text.contains("blockula_mempool_size"), "{text}");
+        let (_, g, _) = call(&n, "GET", "/api/genesis", None, "127.0.0.1:1").await;
+        assert_eq!(g["genesis_hash"], status["genesis_hash"]);
+        // A node without a stored certificate for the range says so (the joiner rotates).
+        let (s, _, _) = call(&n, "GET", "/api/sync?from=1", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        // With one, it serves the batch up to the certified height.
+        n.chain.lock().produce_block_with(vec![]).unwrap();
+        n.chain.lock().store_cert(1, vec![1, 2, 3]).unwrap();
+        let (s, b, _) = call(&n, "GET", "/api/sync?from=1", None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["to"], 1);
+        assert_eq!(b["finalization"], "010203");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn faucet_limits_use_ipv6_64_and_only_count_successful_drips() {
+        let (root, n) = node("faucet");
+        let a = crate::crypto::Keys::from_seed([1; 32]).address();
+        let b = crate::crypto::Keys::from_seed([2; 32]).address();
+        // Two addresses in the same IPv6 /64 share one budget.
+        let (s, _, _) = call(&n, "POST", "/api/faucet", Some(json!({ "to": a })), "[2001:db8:1:2::1]:5000").await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _, _) = call(&n, "POST", "/api/faucet", Some(json!({ "to": b })), "[2001:db8:1:2::ffff]:5000").await;
+        assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+        // A failed drip (busy faucet) doesn't burn the caller's quota.
+        for i in 0..crate::chain::FAUCET_MAX_PENDING as u8 {
+            n.chain.lock().faucet(&crate::crypto::Keys::from_seed([100 + i; 32]).address(), DROPS_PER_FANG).ok();
+        }
+        let (s, e, _) = call(&n, "POST", "/api/faucet", Some(json!({ "to": b })), "203.0.113.5:1").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{e}");
+        n.chain.lock().produce_block().unwrap();
+        let (s, _, _) = call(&n, "POST", "/api/faucet", Some(json!({ "to": b })), "203.0.113.5:1").await;
+        assert_eq!(s, StatusCode::OK, "quota wasn't consumed by the busy attempt");
+        assert_eq!(ip_key("2001:db8:1:2:aaaa::1".parse().unwrap()), "2001:db8:1:2::/64");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_txs_report_status_instead_of_404() {
+        let (root, n) = node("txfail");
+        let k = crate::crypto::Keys::from_seed([9; 32]);
+        n.chain.lock().faucet(&k.address(), 10 * DROPS_PER_FANG).unwrap();
+        n.chain.lock().produce_block().unwrap();
+        let me = n.chain.lock().me().unwrap();
+        let mk = |nonce: u64| {
+            let mut tx = Tx { chain_id: "txfail".into(), from: k.address(), nonce, fee: 0, action: Action::Transfer { to: me.clone(), amount: 6 * DROPS_PER_FANG }, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            tx.fee = min_fee(tx.size());
+            tx.sign(&k)
+        };
+        let (t1, t2) = (mk(0), mk(1));
+        n.chain.lock().produce_block_with(vec![t1, t2.clone()]).unwrap();
+        let (s, v, _) = call(&n, "GET", &format!("/api/tx/{}", t2.id()), None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["status"], "failed");
+        assert!(v["error"].as_str().unwrap().contains("insufficient"));
+        std::fs::remove_dir_all(root).ok();
+    }
 }

@@ -96,11 +96,30 @@ What runs today (Commonware `=2026.9.0`: consensus, p2p, broadcast, storage, run
 - **Consensus:** simplex BFT. Votes and finality certificates are ML-DSA-65 (deterministic FIPS 204 signing, the Commonware namespace is the FIPS 204 context string; `node/src/pq.rs`). A certificate is a signer bitmap plus one 3,309-byte signature per signer, with no aggregation. Leaders rotate round-robin; `block_time_ms` paces proposals.
 - **Deferred execution:** consensus orders blocks (parent, height, proposer = leader, timestamp, txs as signed JSON, plus the proposer's latest executed `(height, state root)`). Before voting, validators check structure, size limits (512 txs / 4 MiB), timestamps, proposer, tx signatures, chain id and minimum fee, and the attached state root if they've executed that height. Finalized blocks are executed in order: invalid txs are skipped, and `blocks.jsonl` is synced before marshal is acknowledged.
 - **Dissemination and backfill:** marshal (standard/inline) broadcasts full blocks, delivers finalized blocks in order, and backfills anything a restarted validator missed.
-- **p2p:** `authenticated::discovery` over tokio with ML-DSA-65 identities (the validator's account seed). The genesis lists every validator's `public_key`, `p2p_addr` and `http_addr`.
+- **p2p:** `authenticated::discovery` over tokio with ML-DSA-65 identities (the validator's account seed). The genesis lists every genesis validator's `public_key`, `p2p_addr` and `http_addr`.
+  - `--bind` sets the local interface (127.0.0.1 by default; 0.0.0.0 or :: on servers). Peers dial the advertised address, which comes from genesis or from a registration.
+  - The `recommended` preset is used for public advertised addresses and `local` for private ones.
+- **Epochs and validator onboarding (Season 0 allowlist):**
+  - Genesis has `epoch_blocks`, `validator_admins`, `min_bond` and `max_validators` (32).
+  - Txs: `register_validator` (bonds FANG, creates a *pending* validator owned by the sender), `approve_validator` / `remove_validator` (admins only), and `unbond` (one full epoch after the validator left).
+  - After executing the last block of epoch *e*, every node computes the set for *e+1* from state: current members minus removed ones, plus approved ones in approval order, capped. It is never empty, and removals that would leave no validator are rejected.
+  - The set is part of state and of the state root.
+  - At the boundary, the node `track`s the new peer set and starts a new simplex engine and scheme for *e+1*, with the boundary block as its floor. This follows the Commonware reshare orchestrator, minus the DKG.
+  - Vote, certificate and resolver channels are muxed by epoch. A node that sees votes from a later epoch hints marshal to fetch our epoch's boundary finalization, so it catches up epoch by epoch.
+  - Marshal spans epochs through an epoch-scoped scheme provider.
+  - Nodes outside the active set observe (verify-only scheme) until their activation epoch.
+  - CLI: `blockula validator init|register|approve|remove|unbond|list`.
+  - API: `/api/validators`. The explorer has a 🧛 Validators page with every admin action.
 - **Mempool:** a tx submitted to any validator is checked against state + mempool, then gossiped to all validators on its own channel and de-duplicated by id. After each finalized block, included or now-invalid txs are evicted.
 - **Faucet (testnets):** each validator's genesis-funded account pays its own faucet drips, so there's no shared secret and no nonce races. Full nodes forward faucet requests.
 - `blockula summon <id> [--validators N]`, `blockula run --home`, `blockula dev` (one-validator simplex).
-- **`blockula join --genesis <file|validator URL> --home <dir>`:** a non-validator full node. It serves the API + explorer immediately (`/api/status` shows `syncing`, `sync_progress` and `finalized_height`). It pulls finalized blocks from validators over HTTP (`/api/sync`), checks the hash links and an ML-DSA quorum finalization certificate per batch, and executes them. Txs and faucet requests are forwarded to a validator. This is a full backfill from genesis; snapshot sync is next.
+- **HTTP hardening:**
+  - 128 KB request bodies.
+  - Per-client tx rate limit. The client is the socket address unless `--client-ip-header` names the reverse proxy's header (e.g. `fly-client-ip`). Forwarded client IPs are honored only from `--trusted-forwarder` IPs or with `BLOCKULA_FORWARDER_SECRET`. IPv6 clients are counted per /64.
+  - Faucet: 1 drip per address per hour and per client per 10 minutes, counted only on success. At most 32 drips pending, otherwise `503 faucet busy`.
+  - Mempool: capped at 5,000 txs and 64 per sender, evicting the lowest fee-per-byte tx when full.
+  - CORS stays permissive for the web wallet.
+- **`blockula join --genesis <file|validator URL> --home <dir>`:** a non-validator full node. It serves the API + explorer immediately (`/api/status` shows `syncing`, `sync_progress` and `finalized_height`). It pulls finalized blocks from validators over HTTP (`/api/sync`), checks the hash links and an ML-DSA quorum finalization certificate per batch, and executes them. Batches never cross an epoch boundary, so each one is checked against that epoch's set, which the node learned by executing the previous boundary. Txs and faucet requests are forwarded to a validator. This is a full backfill from genesis; snapshot sync is next.
 
 Next:
 1. Snapshot sync: download state at a finalized height and verify it against a certified state root (later, a STARK proof of the chain's history), then backfill history in the background.
@@ -113,20 +132,33 @@ Next:
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Dev node, ML-DSA accounts, transfers, `.boo` names, fee burn, built-in explorer + tutorial, TS SDK, passkey helpers, MCP server, `summon`/`run` | ✅ built |
-| 1 | Multi-validator BFT (Commonware) ✅, p2p ✅, `join` ✅ (snapshot sync next), account abstraction + session keys ✅, standalone web wallet (Next.js) with passkey onboarding, indexer + public explorer, public testnet, npm publish | in progress |
+| 1 | Multi-validator BFT (Commonware) ✅, p2p ✅, `join` ✅ (snapshot sync next), epochs + on-chain validator onboarding (Season 0 allowlist) ✅, public networking + HTTP hardening ✅, account abstraction + session keys ✅, passkey web wallet ✅ (blockula-wallet.vercel.app), public testnet on Fly.io ✅ (blockula-testnet.fly.dev), npm `@blockula/sdk` + `@blockula/mcp` ✅, internal security/product review + fixes ✅, CLI wallet ✅, health/metrics ✅. Remaining: snapshot sync, a standalone indexer, prebuilt node binaries | mostly done |
 | 1.5 | GitHub linking, validator checks of GitHub facts, Hunts with acceptance tests, Familiars + MCP contribution tools | |
 | 2 | Séances, Souls, vouching, vesting/clawback, contribution pool, Ghost Mode + viewing keys, The Crypt, proof aggregation | |
-| 3 | Staking/slashing, tokenomics live, governance (conviction voting, repo budgets, fork royalties), audits, mainnet | |
+| 3 | Permissionless staking/slashing (replaces the Season 0 allowlist), tokenomics live, governance (conviction voting, repo budgets, fork royalties), audits, mainnet | |
 | 4 | WASM/RISC-V contracts, light clients, STARK signature aggregation | |
 
 ## Known limits
 
 - **The p2p transport is not post-quantum.** Commonware's handshake authenticates peers with ML-DSA-65, but the session key comes from X25519 and traffic is encrypted with ChaCha20-Poly1305. Recorded traffic could be decrypted by a future quantum computer. Consensus messages are public anyway; making the key exchange PQ (e.g. hybrid X25519 + ML-KEM-768) needs a patched `commonware-cryptography` handshake.
-- The validator set is fixed in genesis: no staking, no epochs or reconfiguration, and no slashing yet (attributable fault evidence is reported by simplex but not acted on).
+- Validator onboarding is a Season 0 allowlist (admin approval), not permissionless staking. The bond isn't slashable yet: simplex reports attributable faults, but nothing acts on them. Voting power is one vote per validator.
+- An approved validator can't connect over p2p until approval (pending registrations aren't admitted as peers). It syncs from genesis via marshal once it's admitted, and votes once caught up. Until then it counts as offline, so approve at most ⌊(n−1)/3⌋ new validators per epoch.
+- If every genesis validator is removed, new nodes still bootstrap from genesis addresses plus the active validators in their *local* state. A brand-new node then needs at least one genesis validator to be reachable, or to start from a peer's copy of the chain.
+- Old epochs' simplex journals stay on disk. Only the last 8 epochs' sets are kept in state, so `/api/sync` can only certify batches from recent epochs for nodes that are far behind.
+- Rate limits are in-memory and per node, so restarting a node resets them, and each node in a pool counts separately. No proxy header is trusted by default.
 - `join` fully backfills from genesis over HTTP and trusts no single peer (certificates are verified), but there's no snapshot sync yet. Full nodes don't serve `/api/sync` themselves.
-- The p2p preset is `local` (allows private IPs), and HTTP binds to 127.0.0.1. Fine for testnets on one machine or a LAN; real deployments need the `recommended` preset and a public bind.
+- Behind NAT (e.g. Fly dedicated IPs), peers see the NATed source address. If the recommended preset rejects such peers, run with `--p2p-preset local`.
 - The state root covers state *before* the block it's embedded in (deferred execution), so a block's own post-state root is in `blocks.jsonl`, not in the certified consensus block.
 - If `consensus/` is ahead of `blocks.jsonl` (e.g. `blocks.jsonl` deleted), the node logs an error; delete `consensus/` to resync.
-- State is cloned per tx and the state root is a flat hash (Phase 1 moves to a Merkle tree for light-client proofs).
-- The faucet is unthrottled (testnets only).
+- The state root is a flat hash over all state, computed once per block (~10 ms per 100k accounts). Phase 1 moves to a Merkle tree for light-client proofs and incremental roots.
+- Txs apply through an undo journal; nothing clones the state per tx. Mempool admission is O(1) per tx using cached per-sender nonces and balance reservations.
+- Failed actions are charged their fee. A failed tx keeps its place in the block, flagged in `failed`.
+- Transfers that create a new account must carry at least 0.01 FANG.
+- `exec_root` is still a best-effort check. Each block must cite a state root at most 16 heights behind the verifier's executed height, and verifiers that have executed that height check it. A root that no honest verifier has executed yet goes unchecked until one has.
+- Storage:
+  - Marshal keeps 2,000 heights of blocks and certificates and prunes the rest.
+  - Every node keeps all consensus blocks (`cblocks.bin`) plus finalization certificates every 100 heights and at epoch ends (`certs.bin`), so it can serve verified `/api/sync` batches.
+  - Only the last 2,048 executed blocks and 1,024 certificates stay in memory.
+  - A node whose consensus storage predates this layout must re-sync (`consensus.version`).
+- The faucet is rate limited per address and per client (/64 for IPv6), but a determined attacker with many IPs can still drain it slowly. It's for testnets only.
 - `sdk-ts/src/passkey.ts` typechecks but hasn't been exercised in a real browser yet.

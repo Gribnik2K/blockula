@@ -142,3 +142,7 @@ input.mono { font-size: 14px; }
   header nav { gap: 12px; }
 }
 @media (prefers-reduced-motion: reduce) { .bat, .spinner { animation: none; } }
+
+.banner.danger { background: #5a0f1f; font-weight: 500; }
+.net-select { background: var(--panel, #181121); color: inherit; border: 1px solid var(--line, #2c2038); border-radius: 8px; padding: 4px 6px; }
+.break { word-break: break-all; }

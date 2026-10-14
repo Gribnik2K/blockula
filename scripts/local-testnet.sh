@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Local multi-node smoke test: 4 validators (simplex BFT over authenticated p2p) + 1 full node
-# that joins over HTTP. Runs the SDK e2e against a validator and against the full node, restarts
-# a validator mid-run, then checks every node agrees on block hashes and state roots.
+# Local multi-node smoke test: 4 genesis validators (simplex BFT over authenticated p2p) + 1 full
+# node that joins over HTTP + a 5th validator onboarded with the CLI (init → faucet → register →
+# admin approve → active at the next epoch). Runs the SDK e2e against a validator and against the
+# full node, restarts a validator mid-run, then checks every node agrees on hashes and state roots.
 #
 #   scripts/local-testnet.sh            # build release, run, tear down
 #   KEEP=1 scripts/local-testnet.sh     # leave the testnet running afterwards
@@ -28,7 +29,9 @@ trap cleanup EXIT
 [[ -n "${SKIP_BUILD:-}" ]] || cargo build --release --manifest-path node/Cargo.toml
 echo "📁 $DIR"
 
-"$BIN" summon testnet --home "$DIR" --validators "$N"
+EPOCH=${EPOCH:-20}
+"$BIN" summon testnet --home "$DIR" --validators "$N" --epoch-blocks "$EPOCH" | tee "$DIR/summon.txt"
+GHASH=$(grep -o 'genesis hash: [0-9a-f]*' "$DIR/summon.txt" | awk '{print $3}')
 addr() { node -e "console.log(require('$DIR/genesis.json').validators[$1].http_addr)"; }
 status() { curl -sf -m 3 "http://$1/api/status"; }
 field() { node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s)$1))"; }
@@ -51,12 +54,40 @@ V0=$(addr 0); V2=$(addr 2)
 wait_height "$V0" 3
 echo "✓ validators are finalizing blocks"
 
-"$BIN" join --genesis "http://$V0" --home "$DIR/full" --port "$FULL_PORT" >"$DIR/full.log" 2>&1 &
+"$BIN" join --genesis "http://$V0" --genesis-hash "$GHASH" --home "$DIR/full" --port "$FULL_PORT" >"$DIR/full.log" 2>&1 &
 PIDS[$N]=$!
 FULL="127.0.0.1:$FULL_PORT"
 
 echo "— SDK e2e against validator 2 (faucet + txs gossiped to whoever leads)"
 BLOCKULA_RPC="http://$V2" npm test -w @blockula/sdk
+
+echo "— onboarding a validator with the CLI"
+"$BIN" validator init --home "$DIR/v$N" --genesis "http://$V0" | tee "$DIR/init.txt"
+NEWV=$(grep -o 'boo1[0-9a-z]*' "$DIR/init.txt" | head -1)
+curl -sf -X POST -H 'content-type: application/json' -d "{\"to\":\"$NEWV\"}" "http://$V0/api/faucet" >/dev/null
+for _ in $(seq 1 60); do
+  bal=$(curl -sf "http://$V0/api/account/$NEWV" | field .balance 2>/dev/null || echo 0)
+  [[ "$bal" != "0" ]] && break; sleep 1
+done
+"$BIN" validator register --home "$DIR/v$N" --rpc "http://$V2"
+"$BIN" run --home "$DIR/v$N" >>"$DIR/v$N.log" 2>&1 &
+PIDS[$((N + 1))]=$!
+"$BIN" validator approve "$NEWV" --key "$DIR/v0/validator.key" --rpc "http://$V0"
+active=""
+for _ in $(seq 1 $((EPOCH * 3 + 30))); do
+  active=$(curl -sf "http://$V0/api/validators" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).active.some(v=>v.validator.address==='$NEWV')))")
+  [[ "$active" == "true" ]] && break; sleep 1
+done
+[[ "$active" == "true" ]] || { echo "❌ new validator never became active" >&2; exit 1; }
+NEWHTTP=$(node -e "console.log(require('$DIR/v$N/node.json').http_addr)")
+wait_height "$NEWHTTP" "$(status "$V0" | field .height)"
+proposed=0
+for _ in $(seq 1 60); do
+  proposed=$(curl -sf "http://$V0/api/blocks?limit=100" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).filter(b=>b.proposer.address==='$NEWV').length))")
+  [[ "$proposed" -gt 0 ]] && break; sleep 1
+done
+[[ "$proposed" -gt 0 ]] || { echo "❌ new validator never proposed a block" >&2; exit 1; }
+echo "✓ validator $NEWV joined at an epoch boundary and is proposing blocks"
 
 echo "— restarting validator 1"
 kill "${PIDS[1]}"; wait "${PIDS[1]}" 2>/dev/null || true
@@ -70,7 +101,7 @@ BLOCKULA_RPC="http://$FULL" npm test -w @blockula/sdk
 # Agreement: same hash and state root at a common height on every node.
 NODES=()
 for i in $(seq 0 $((N - 1))); do NODES+=("$(addr "$i")"); done
-NODES+=("$FULL")
+NODES+=("$NEWHTTP" "$FULL")
 target=$(status "$V0" | field .height)
 for n in "${NODES[@]}"; do wait_height "$n" "$target"; done
 ref=""
@@ -80,4 +111,24 @@ for n in "${NODES[@]}"; do
   [[ -z "$ref" ]] && ref=$line
   [[ "$line" == "$ref" ]] || { echo "❌ nodes disagree at height $target" >&2; exit 1; }
 done
-echo "✓ all $((N + 1)) nodes agree on block #$target (hash + state root)"
+echo "✓ all $((N + 2)) nodes agree on block #$target (hash + state root)"
+
+echo "— CLI wallet"
+W="$DIR/wallet-home"
+BLOCKULA_HOME="$W" "$BIN" wallet new
+BLOCKULA_HOME="$W" "$BIN" wallet faucet --rpc "http://$FULL"
+for _ in $(seq 1 30); do
+  out=$(BLOCKULA_HOME="$W" "$BIN" wallet balance --rpc "http://$FULL")
+  [[ "$out" == *"100 FANG"* ]] && break; sleep 1
+done
+echo "  $out"
+BLOCKULA_HOME="$W" "$BIN" wallet send "$NEWV" 1.5 --memo "cli wallet" --rpc "http://$V0"
+
+echo "— health and memory"
+for n in "${NODES[@]}"; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' "http://$n/api/health")
+  echo "  $n /api/health → $code"
+done
+for p in "${PIDS[@]}"; do
+  [[ -n "$p" ]] && ps -o pid=,rss=,command= -p "$p" 2>/dev/null | awk '{printf "  pid %s  RSS %.0f MB  %s %s %s\n", $1, $2/1024, $3, $4, $5}'
+done

@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useState } from "react";
 import { RequireWallet } from "@/components/Gate";
 import { Copy, ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
-import { explorer } from "@/lib/config";
+import { BLOCKS_PER_DAY, explorer } from "@/lib/config";
 import { friendly } from "@/lib/errors";
 import { blocksToHuman, isKeyId, keyCode } from "@/lib/format";
 import type { KeyView, TxView } from "@/lib/types";
@@ -175,8 +175,8 @@ function AddAgent() {
   }
   const valid = isKeyId(key) && limitOk && Number.isInteger(nDays) && nDays > 0 && nDays <= 365;
   const me = account?.names[0] ?? wallet.account;
-  // A "day" in blocks, from the chain's block time (86,400 at 1-second blocks).
-  const day = Math.round(86_400_000 / (status?.block_time_ms ?? 1000));
+  // A "day" in blocks. A fixed constant: block timing reported by the node isn't trusted here.
+  const day = BLOCKS_PER_DAY;
 
   const add = async () => {
     setBusy(true);
@@ -238,6 +238,11 @@ SDK:  await wallet.actAs("${me}");
       <button className="btn primary" disabled={!valid || busy} onClick={add}>
         {busy ? <Spinner>Granting…</Spinner> : `Allow ${limitOk ? limit : "…"} FANG/day`}
       </button>
+      {valid && (
+        <p className="dim small">
+          You&apos;ll sign: key <span className="mono">{key.slice(0, 12)}…</span> may send at most {limit} FANG (amount + fees) every {BLOCKS_PER_DAY.toLocaleString()} blocks (~1 day), transfers only, until {nDays} days of blocks from now. Revoke it any time.
+        </p>
+      )}
       <ErrorNote error={error} />
       {done && (
         <div className="stack">

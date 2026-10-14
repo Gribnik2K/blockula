@@ -32,14 +32,24 @@ pub fn system_address(label: &str) -> String {
 }
 
 pub fn address_bytes(s: &str) -> Option<[u8; 32]> {
+    if !is_address(s) {
+        return None;
+    }
     match bech32::decode(s) {
         Ok((hrp, data)) if hrp.as_str() == ADDRESS_HRP => data.try_into().ok(),
         _ => None,
     }
 }
 
+/// Canonical (lowercase) `boo1…` address. Bech32 also accepts all-uppercase strings, which
+/// would alias accounts, so they're rejected.
 pub fn is_address(s: &str) -> bool {
-    matches!(bech32::decode(s), Ok((hrp, data)) if hrp.as_str() == ADDRESS_HRP && data.len() == 32)
+    s.len() <= 90 && !s.bytes().any(|b| b.is_ascii_uppercase()) && matches!(bech32::decode(s), Ok((hrp, data)) if hrp.as_str() == ADDRESS_HRP && data.len() == 32)
+}
+
+/// Lowercase hex only (no uppercase aliases of the same bytes).
+pub fn is_lower_hex(s: &str) -> bool {
+    s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub struct Keys {

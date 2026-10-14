@@ -16,7 +16,7 @@ use crate::pq::{MlDsaScheme, PrivateKey, PublicKey};
 use crate::types::{min_fee, Tx};
 use bytes::{Buf, BufMut};
 use commonware_broadcast::buffered;
-use commonware_codec::{EncodeSize, Error as CodecError, Read, Write, Encode};
+use commonware_codec::{Decode as _, EncodeSize, Error as CodecError, Read, Write, Encode};
 use commonware_consensus::{
     Application, Block, Heightable, Reporter, Reporters,
     marshal::{self, Update, ancestry::Ancestry, core::Actor as MarshalActor, resolver::p2p as marshal_resolver, standard::Inline},
@@ -24,31 +24,34 @@ use commonware_consensus::{
         self,
         config::{ForwardPolicy, SkipBudget, SkipPolicy},
         elector::RoundRobin,
-        types::{Activity, Context as SimplexContext},
+        types::{Activity, Context as SimplexContext, Finalization},
     },
     types::{Epoch, FixedEpocher, Height, ViewDelta},
 };
-use commonware_cryptography::{Blake3, Digestible, Hasher, Signer as _, blake3::Digest, certificate::ConstantProvider};
-use commonware_p2p::{Blocker, Provider, Receiver, Recipients, Sender};
+use commonware_cryptography::{Blake3, Digestible, Hasher, Signer as _, blake3::Digest, certificate::{self, Scoped, Scheme as _}};
+use commonware_p2p::{Blocker, Manager, Provider, Receiver, Recipients, Sender, TrackedPeers, utils::mux::{Builder as _, Muxer}};
 use commonware_parallel::Sequential;
 use commonware_runtime::{BufferPooler, Clock, Handle, Metrics, Spawner, Storage, buffer::paged::CacheRef};
-use commonware_storage::archive::immutable;
-use commonware_utils::{NZU16, NZU64, NZUsize, ordered::Set};
+use commonware_storage::{archive::prunable, translator::TwoCap};
+use commonware_utils::{NZU64, NZUsize, ordered::Set};
 use futures::StreamExt;
 use parking_lot::Mutex;
 use rand_core::CryptoRng;
-use std::{collections::HashMap, num::NonZeroU32, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
-use tracing::{debug, error, warn};
+use std::{collections::HashMap, num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize}, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use tracing::{debug, error, info, warn};
 
 pub type Shared = Arc<Mutex<Chain>>;
 pub type MarshalMailbox = marshal::core::Mailbox<MlDsaScheme, marshal::standard::Standard<CBlock>>;
 
 pub const MAX_BLOCK_TXS: usize = 512;
-pub const MAX_TX_BYTES: usize = 64 * 1024;
+pub use crate::types::MAX_TX_BYTES;
+/// A proposal's `exec_height` may trail the verifier's executed height by at most this much
+/// (so a proposer can't dodge the state-root check by citing an ancient height).
+pub const MAX_EXEC_LAG: u64 = 16;
 pub const MAX_BLOCK_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_MESSAGE_SIZE: u32 = 8 * 1024 * 1024;
 /// How far in the future (by our clock) a block timestamp may be.
-pub const MAX_CLOCK_DRIFT_MS: u64 = 5_000;
+pub const MAX_CLOCK_DRIFT_MS: u64 = 1_000;
 
 /// p2p channels.
 pub const CH_VOTES: u64 = 0;
@@ -208,6 +211,7 @@ pub fn hex_32(s: &str) -> [u8; 32] {
     hex::decode(s).ok().and_then(|v| v.try_into().ok()).unwrap_or([0; 32])
 }
 
+#[allow(dead_code)]
 pub fn participants(g: &Genesis) -> anyhow::Result<Set<PublicKey>> {
     let keys = g
         .validators
@@ -234,7 +238,7 @@ pub fn check_tx_stateless(tx: &Tx, chain_id: &str) -> anyhow::Result<()> {
     if tx.chain_id != chain_id {
         anyhow::bail!("wrong chain id");
     }
-    tx.sender()?;
+    tx.check_format()?;
     if tx.fee < min_fee(tx.size()) {
         anyhow::bail!("fee below minimum");
     }
@@ -261,47 +265,63 @@ where
         let height = parent.height + 1;
         let proposer = cctx.leader.address();
 
-        let (chain_id, exec_height, exec_root, mut scratch, mempool) = {
-            let c = self.chain.lock();
-            (c.genesis.chain_id.clone(), c.height(), hex_32(&c.state.root()), c.state.clone(), c.mempool.clone())
-        };
         // Blocks between what we've executed and the parent are ordered but not yet executed:
-        // replay them on a scratch state so we don't re-propose (or overdraw) their txs.
+        // collect them so we don't re-propose (or overdraw) their txs.
+        let exec_height = self.chain.lock().height();
         let mut pending = vec![parent.clone()];
         if parent.height > exec_height {
             while pending.last().unwrap().height > exec_height + 1 {
                 if pending.len() > 64 {
                     // Far behind (still catching up): propose an empty block rather than guess.
-                    return Some(CBlock::new(parent.digest(), height, timestamp_ms, proposer, exec_height, exec_root, vec![]));
+                    let c = self.chain.lock();
+                    return Some(CBlock::new(parent.digest(), height, timestamp_ms, proposer, c.height(), hex_32(&c.state.root()), vec![]));
                 }
                 pending.push(ancestry.next().await?);
             }
         } else {
             pending.clear();
         }
+        // Build on a journal over the live state (rolled back afterwards) — no state clone.
+        let mut c = self.chain.lock();
+        if c.height() != exec_height {
+            // We executed more blocks meanwhile; drop the ones now executed.
+            let h = c.height();
+            pending.retain(|b| b.height > h);
+        }
+        let (chain_id, exec_height, exec_root) = (c.genesis.chain_id.clone(), c.height(), hex_32(&c.state.root()));
+        let mut j = crate::chain::Journal::default();
         let mut included = std::collections::HashSet::new();
         for b in pending.iter().rev() {
             for tx in b.parse_txs().into_iter().flatten() {
                 included.insert(tx.id());
-                let _ = scratch.apply(&tx, &chain_id, &b.proposer, b.height);
+                let _ = c.state.apply_j(&mut j, &tx, &chain_id, &b.proposer, b.height, false);
             }
         }
+        let mempool = c.mempool.clone();
         let mut txs = vec![];
         let mut bytes = 0;
         for tx in mempool {
             if txs.len() >= MAX_BLOCK_TXS {
                 break;
             }
-            if included.contains(&tx.id()) || scratch.apply(&tx, &chain_id, &proposer, height).is_err() {
+            let raw = serde_json::to_vec(&tx).expect("tx json");
+            if raw.len() > MAX_TX_BYTES || bytes + raw.len() > MAX_BLOCK_BYTES || included.contains(&tx.id()) {
                 continue;
             }
-            let raw = serde_json::to_vec(&tx).expect("tx json");
-            if raw.len() > MAX_TX_BYTES || bytes + raw.len() > MAX_BLOCK_BYTES {
-                continue;
+            // Only propose txs that will succeed; a tx that would just burn its fee waits/expires.
+            let mut tj = crate::chain::Journal::default();
+            match c.state.apply_j(&mut tj, &tx, &chain_id, &proposer, height, false) {
+                Ok(crate::chain::Outcome::Applied) => j.absorb_pub(tj),
+                Ok(crate::chain::Outcome::Failed(_)) | Err(_) => {
+                    c.state.rollback(tj);
+                    continue;
+                }
             }
             bytes += raw.len();
             txs.push(raw);
         }
+        c.state.rollback(j);
+        drop(c);
         debug!(height, txs = txs.len(), "proposing");
         Some(CBlock::new(parent.digest(), height, timestamp_ms, proposer, exec_height, exec_root, txs))
     }
@@ -329,23 +349,35 @@ where
         }
         let chain_id = {
             let c = self.chain.lock();
-            if let Some(root) = c.root_at(block.exec_height) {
-                if hex_32(root) != block.exec_root {
-                    return reject("state root mismatch");
+            if block.exec_height + MAX_EXEC_LAG < c.height().min(parent.height) {
+                return reject("exec_height too far behind");
+            }
+            if block.exec_height <= c.height() {
+                match c.root_at(block.exec_height) {
+                    Some(root) if hex_32(&root) == block.exec_root => {}
+                    _ => return reject("state root mismatch"),
                 }
             }
             c.genesis.chain_id.clone()
         };
+        // Signature checks happen without holding the chain lock.
         let mut seen = std::collections::HashSet::new();
+        let mut ids = vec![];
         for raw in &block.txs {
             let Ok(tx) = serde_json::from_slice::<Tx>(raw) else { return reject("unparseable tx") };
-            if !seen.insert(tx.id()) {
+            let id = tx.id();
+            if !seen.insert(id.clone()) {
                 return reject("duplicate tx");
             }
             if let Err(e) = check_tx_stateless(&tx, &chain_id) {
                 warn!(error = %e, "bad tx in block");
                 return reject("invalid tx");
             }
+            ids.push(id);
+        }
+        let c = self.chain.lock();
+        if ids.iter().any(|id| c.tx_index.contains_key(id)) {
+            return reject("replays an already-finalized tx");
         }
         true
     }
@@ -356,7 +388,7 @@ where
 /// Remembers finalization certificates by block digest so executed blocks can carry their proof.
 #[derive(Clone, Default)]
 pub struct CertCapture {
-    certs: Arc<Mutex<HashMap<Digest, String>>>,
+    certs: Arc<Mutex<HashMap<Digest, Vec<u8>>>>,
 }
 
 impl Reporter for CertCapture {
@@ -367,20 +399,24 @@ impl Reporter for CertCapture {
             if certs.len() > 4096 {
                 certs.clear();
             }
-            certs.insert(f.proposal.payload, hex::encode(f.encode()));
+            certs.insert(f.proposal.payload, f.encode().to_vec());
         }
         commonware_actor::Feedback::Ok
     }
 }
 
-/// Receives finalized blocks from marshal, in order, and executes them.
+/// Receives finalized blocks from marshal, in order, and executes them. After the last block of
+/// an epoch it tells the orchestrator which epoch to enter next.
 #[derive(Clone)]
 pub struct Executor {
     pub chain: Shared,
     pub certs: CertCapture,
+    pub epochs: futures::channel::mpsc::UnboundedSender<u64>,
+    /// For pruning old finalized data out of marshal's archives.
+    pub marshal: Option<MarshalMailbox>,
 }
 
-pub fn finalized_from(b: &CBlock, certificate: String) -> Finalized {
+pub fn finalized_from(b: &CBlock, certificate: Option<Vec<u8>>) -> Finalized {
     Finalized {
         height: b.height,
         hash: hex::encode(b.digest.0),
@@ -388,6 +424,7 @@ pub fn finalized_from(b: &CBlock, certificate: String) -> Finalized {
         timestamp_ms: b.timestamp_ms,
         proposer: b.proposer.clone(),
         txs: b.parse_txs().into_iter().flatten().collect(),
+        cblock: b.encode().to_vec(),
         certificate,
     }
 }
@@ -406,10 +443,20 @@ impl Reporter for Executor {
                 if block.height <= c.height() {
                     ack.acknowledge(); // redelivery after restart: already executed
                 } else {
-                    let cert = self.certs.certs.lock().remove(&block.digest).unwrap_or_default();
+                    let cert = self.certs.certs.lock().remove(&block.digest);
                     match c.execute(finalized_from(&block, cert)) {
                         Ok(()) => {
-                            debug!(height = block.height, txs = c.blocks.last().map(|b| b.txs.len()).unwrap_or(0), root = %c.state.root(), "executed");
+                            debug!(height = block.height, txs = c.last_block().map(|b| b.txs.len()).unwrap_or(0), "executed");
+                            if block.height % 100 == 0 && block.height > MARSHAL_RETAIN {
+                                if let Some(m) = &self.marshal {
+                                    m.prune(Height::new(block.height - MARSHAL_RETAIN));
+                                }
+                            }
+                            if c.state.params.is_boundary(block.height) {
+                                let next = c.state.params.epoch_of(block.height) + 1;
+                                info!(epoch = next, validators = c.state.active_sets.get(&next).map(|s| s.len()).unwrap_or(0), "epoch boundary");
+                                let _ = self.epochs.unbounded_send(next);
+                            }
                             ack.acknowledge();
                         }
                         // Not acknowledging makes marshal stop: better than diverging silently.
@@ -422,28 +469,94 @@ impl Reporter for Executor {
     }
 }
 
+// --------------------------------------------------------------------------------- epochs
+
+/// Validator set (and signing scheme) per epoch, read from executed state.
+#[derive(Clone)]
+pub struct EpochProvider {
+    chain: Shared,
+    key: Option<PrivateKey>,
+    namespace: Vec<u8>,
+    cache: Arc<Mutex<HashMap<u64, Arc<MlDsaScheme>>>>,
+}
+
+impl EpochProvider {
+    pub fn new(chain: Shared, key: Option<PrivateKey>) -> Self {
+        let namespace = namespace(&chain.lock().genesis.chain_id);
+        Self { chain, key, namespace, cache: Default::default() }
+    }
+
+    pub fn participants(&self, epoch: u64) -> Option<Set<PublicKey>> {
+        let c = self.chain.lock();
+        keys_of(c.state.active_set(epoch)?.iter().map(|v| v.consensus_key.as_str()))
+    }
+
+    /// Approved (and active) validators: allowed to connect as secondary peers, so an approved
+    /// validator that didn't fit under the cap can still sync. Pending registrations can't
+    /// connect (anyone can register, so they'd let strangers in).
+    pub fn candidates(&self) -> Set<PublicKey> {
+        use crate::chain::ValidatorStatus::{Active, Approved};
+        let c = self.chain.lock();
+        let keys: Vec<PublicKey> = c.state.validators.values().filter(|v| matches!(v.status, Approved | Active)).filter_map(|v| PublicKey::from_bytes(&hex::decode(&v.consensus_key).ok()?)).collect();
+        Set::from_iter_dedup(keys)
+    }
+
+    pub fn epoch_scheme(&self, epoch: u64) -> Option<Arc<MlDsaScheme>> {
+        if let Some(s) = self.cache.lock().get(&epoch) {
+            return Some(s.clone());
+        }
+        let parts = self.participants(epoch)?;
+        let scheme = match &self.key {
+            Some(k) if parts.position(&k.public_key()).is_some() => MlDsaScheme::signer(&self.namespace, parts, k.clone())?,
+            _ => MlDsaScheme::verifier(&self.namespace, parts),
+        };
+        let scheme = Arc::new(scheme);
+        let mut cache = self.cache.lock();
+        cache.insert(epoch, scheme.clone());
+        if cache.len() > 16 {
+            let oldest = *cache.keys().min().unwrap();
+            cache.remove(&oldest);
+        }
+        Some(scheme)
+    }
+}
+
+pub fn keys_of<'a>(hex_keys: impl Iterator<Item = &'a str>) -> Option<Set<PublicKey>> {
+    let keys: Option<Vec<PublicKey>> = hex_keys.map(|k| PublicKey::from_bytes(&hex::decode(k).ok()?)).collect();
+    Set::try_from(keys?).ok()
+}
+
+impl certificate::Provider for EpochProvider {
+    type Scope = Epoch;
+    type Scheme = MlDsaScheme;
+    fn scoped(&self, epoch: Epoch) -> Option<Scoped<MlDsaScheme>> {
+        let s = self.epoch_scheme(epoch.get())?;
+        Some(if s.me().is_some() { Scoped::scheme(s) } else { Scoped::verifier(s) })
+    }
+}
+
 // ----------------------------------------------------------------------------------- wiring
 
 pub struct ValidatorConfig {
     pub chain: Shared,
     pub key: PrivateKey,
-    pub participants: Set<PublicKey>,
     pub genesis: CBlock,
-    pub chain_id: String,
     pub block_time_ms: u64,
+    pub epoch_blocks: u64,
     /// Prefix for all on-disk partitions (lets several validators share one runtime in tests).
     pub partition: String,
 }
 
 pub type Channel<S, R> = (S, R);
 
-/// Starts marshal, simplex and mempool gossip for one validator over already-registered p2p
-/// channels (`CHANNELS` order). Generic over runtime and network so the deterministic simulator
-/// and the real tokio + authenticated-discovery stack share this code.
-pub async fn start_validator<E, Pv, Bl, S, R>(context: E, cfg: ValidatorConfig, provider: Pv, blocker: Bl, mut channels: Vec<Channel<S, R>>) -> (Handle<()>, MarshalMailbox)
+/// Starts marshal, the epoch orchestrator (one simplex engine per epoch) and mempool gossip for
+/// one node over already-registered p2p channels (`CHANNELS` order). The node votes in epochs
+/// whose set contains its key and observes the others. Generic over runtime and network so the
+/// deterministic simulator and the real tokio + authenticated-discovery stack share this code.
+pub async fn start_validator<E, Pm, Bl, S, R>(context: E, cfg: ValidatorConfig, peers: Pm, blocker: Bl, mut channels: Vec<Channel<S, R>>) -> (Handle<()>, MarshalMailbox)
 where
     E: BufferPooler + Clock + CryptoRng + Spawner + Storage + Metrics,
-    Pv: Provider<PublicKey = PublicKey> + Clone,
+    Pm: Provider<PublicKey = PublicKey> + Manager<PublicKey = PublicKey> + Clone,
     Bl: Blocker<PublicKey = PublicKey> + Clone,
     S: Sender<PublicKey = PublicKey>,
     R: Receiver<PublicKey = PublicKey>,
@@ -456,14 +569,14 @@ where
     let certs_net = channels.pop().unwrap();
     let votes_net = channels.pop().unwrap();
 
-    let ns = namespace(&cfg.chain_id);
     let me = cfg.key.public_key();
-    let scheme = MlDsaScheme::signer(&ns, cfg.participants.clone(), cfg.key.clone()).expect("validator key must be in the validator set");
-    let page_cache = CacheRef::from_pooler(&context, NZU16!(4096), NZUsize!(1024));
+    let provider = EpochProvider::new(cfg.chain.clone(), Some(cfg.key.clone()));
+    let page_cache = CacheRef::from_pooler(&context, NonZeroU16::new(PAGE_SIZE).unwrap(), NonZeroUsize::new(PAGE_CACHE_PAGES).unwrap());
     let prefix = cfg.partition.clone();
     let chain = cfg.chain.clone();
     let block_time_ms = cfg.block_time_ms;
     let genesis = cfg.genesis.clone();
+    let epoch_len = NonZeroU64::new(cfg.epoch_blocks.max(2)).unwrap();
 
     let (marshal_tx, marshal_rx) = futures::channel::oneshot::channel();
     let handle = context.child("validator").spawn(move |context| async move {
@@ -471,7 +584,7 @@ where
             context.child("marshal_resolver"),
             marshal_resolver::Config {
                 public_key: me.clone(),
-                peer_provider: provider.clone(),
+                peer_provider: peers.clone(),
                 blocker: blocker.clone(),
                 mailbox_size: NZUsize!(1024),
                 timeout: Duration::from_secs(2),
@@ -483,28 +596,28 @@ where
         );
         let (broadcast_engine, buffer) = buffered::Engine::new(
             context.child("broadcast"),
-            buffered::Config { public_key: me.clone(), mailbox_size: NZUsize!(1024), deque_size: 16, priority: false, codec_config: (), peer_provider: provider.clone() },
+            buffered::Config { public_key: me.clone(), mailbox_size: NZUsize!(1024), deque_size: 16, priority: false, codec_config: (), peer_provider: peers.clone() },
         );
         broadcast_engine.start(blocks_net);
 
-        let finalizations = immutable::Archive::init(context.child("finalizations"), archive_config(&prefix, "finalizations", page_cache.clone(), u32::MAX as usize)).await.expect("finalizations archive");
-        let blocks = immutable::Archive::init(context.child("blocks"), archive_config(&prefix, "blocks", page_cache.clone(), ())).await.expect("blocks archive");
+        let finalizations = prunable::Archive::init(context.child("finalizations"), archive_config(&prefix, "finalizations", page_cache.clone(), 1024usize)).await.expect("finalizations archive");
+        let blocks = prunable::Archive::init(context.child("blocks"), archive_config(&prefix, "blocks", page_cache.clone(), ())).await.expect("blocks archive");
         let (marshal_actor, marshal, floor) = MarshalActor::init(
             context.child("marshal"),
             finalizations,
             blocks,
             marshal::Config {
-                provider: ConstantProvider::new(scheme.clone()),
-                epocher: FixedEpocher::new(NZU64!(u64::MAX / 2)),
+                provider: provider.clone(),
+                epocher: FixedEpocher::new(epoch_len),
                 start: marshal::Start::Genesis(genesis.clone()),
                 partition_prefix: format!("{prefix}-marshal"),
                 mailbox_size: NZUsize!(1024),
                 view_retention: ViewDelta::new(10),
                 prunable_items_per_section: NZU64!(64),
                 page_cache: page_cache.clone(),
-                replay_buffer: NZUsize!(1 << 20),
-                key_write_buffer: NZUsize!(1 << 20),
-                value_write_buffer: NZUsize!(1 << 20),
+                replay_buffer: NonZeroUsize::new(IO_BUFFER).unwrap(),
+                key_write_buffer: NonZeroUsize::new(IO_BUFFER).unwrap(),
+                value_write_buffer: NonZeroUsize::new(IO_BUFFER).unwrap(),
                 block_codec_config: (),
                 max_repair: NZUsize!(64),
                 max_pending_acks: NZUsize!(1),
@@ -512,104 +625,262 @@ where
             },
         )
         .await;
-        if let Some(processed) = floor.height() {
-            let ours = chain.lock().height();
-            if processed.get() > ours {
-                error!(marshal = processed.get(), ours, "consensus storage is ahead of blocks.jsonl; delete the `consensus` dir to resync");
+        let processed = floor.height().map(|h| h.get()).unwrap_or(0);
+        let ours = chain.lock().height();
+        if processed > ours {
+            error!(marshal = processed, ours, "consensus storage is ahead of blocks.jsonl; delete the `consensus` dir to resync");
+        } else if ours > processed {
+            // We executed past marshal (HTTP catch-up): anchor marshal at our latest certified
+            // block so it doesn't try to backfill what peers may have pruned.
+            let c = chain.lock();
+            let anchor = (ours.saturating_sub(MARSHAL_RETAIN)..=ours).rev().find_map(|h| c.cert(h).map(|b| (h, b)));
+            drop(c);
+            match anchor.and_then(|(h, b)| Finalization::<MlDsaScheme, Digest>::decode_cfg(b.as_slice(), &1024usize).ok().map(|f| (h, f))) {
+                Some((h, f)) => {
+                    info!(height = h, "anchoring marshal at our certified tip");
+                    marshal.set_floor(f);
+                }
+                None => warn!(ours, processed, "no certificate near our tip; marshal will backfill from peers"),
             }
         }
         let _ = marshal_tx.send(marshal.clone());
 
         let certs = CertCapture::default();
-        let executor = Executor { chain: chain.clone(), certs: certs.clone() };
+        let (epoch_tx, mut epoch_rx) = futures::channel::mpsc::unbounded::<u64>();
+        let executor = Executor { chain: chain.clone(), certs: certs.clone(), epochs: epoch_tx, marshal: Some(marshal.clone()) };
         marshal_actor.start(executor, buffer, resolver);
 
-        let app = Inline::new(context.child("inline"), App { chain: chain.clone(), block_time_ms }, marshal.clone(), FixedEpocher::new(NZU64!(u64::MAX / 2)));
-        let bt = Duration::from_millis(block_time_ms);
-        let engine = simplex::Engine::new(
-            context.child("simplex"),
-            simplex::config::Config {
-                scheme,
-                elector: RoundRobin::<Blake3>::default(),
-                blocker: blocker.clone(),
-                automaton: app.clone(),
-                relay: app,
-                reporter: Reporters::from((marshal.clone(), certs)),
-                strategy: Sequential,
-                partition: format!("{prefix}-simplex"),
-                mailbox_size: NZUsize!(1024),
-                epoch: Epoch::zero(),
-                floor: simplex::config::Floor::Genesis(genesis.digest()),
-                replay_buffer: NZUsize!(1 << 20),
-                write_buffer: NZUsize!(1 << 20),
-                page_cache,
-                leader_timeout: bt + Duration::from_secs(2),
-                certification_timeout: bt + Duration::from_secs(3),
-                timeout_retry: Duration::from_secs(5),
-                fetch_timeout: Duration::from_secs(2),
-                view_retention: ViewDelta::new(10),
-                skip: SkipPolicy::Enabled { timeout: bt * 10 + Duration::from_secs(10), budget: SkipBudget::Participants },
-                forward: ForwardPolicy::Disabled,
-                track_historical_votes: false,
-            },
-        );
-        engine.start(votes_net, certs_net, resolver_net);
-
-        // Mempool gossip: push every locally accepted tx to all validators; accept theirs.
+        // Mempool gossip: push every locally accepted tx to all peers; accept theirs.
         let (gossip_tx, mut gossip_rx) = futures::channel::mpsc::unbounded::<Tx>();
         chain.lock().gossip = Some(gossip_tx);
-        let (mut sender, mut receiver) = mempool_net;
+        let (mut mp_sender, mut mp_receiver) = mempool_net;
         context.child("mempool_out").spawn(move |_| async move {
             while let Some(tx) = gossip_rx.next().await {
                 let raw = serde_json::to_vec(&tx).expect("tx json");
-                let _ = sender.send(Recipients::All, raw, false);
+                let _ = mp_sender.send(Recipients::All, raw, false);
             }
         });
+        let gossip_chain = chain.clone();
+        context.child("mempool_in").spawn(move |_| async move {
+            loop {
+                let Ok((from, msg)) = mp_receiver.recv().await else { break };
+                let raw: Vec<u8> = msg.as_ref().to_vec();
+                if raw.len() > MAX_TX_BYTES {
+                    continue;
+                }
+                let Ok(tx) = serde_json::from_slice::<Tx>(&raw) else {
+                    debug!(?from, "unparseable gossiped tx");
+                    continue;
+                };
+                // Verify format + ML-DSA signature before taking the chain lock.
+                let chain_id = gossip_chain.lock().genesis.chain_id.clone();
+                if let Err(e) = check_tx_stateless(&tx, &chain_id) {
+                    debug!(?from, error = %e, "dropping invalid gossiped tx");
+                    continue;
+                }
+                let mut c = gossip_chain.lock();
+                // Don't echo gossip back out; the originator already sent it to everyone.
+                let g = c.gossip.take();
+                if let Err(e) = c.submit_tx(tx) {
+                    debug!(error = %e, "dropping gossiped tx");
+                }
+                c.gossip = g;
+            }
+        });
+
+        // Epoch orchestrator: one simplex engine per epoch, consensus channels muxed by epoch.
+        let (mux, mut votes, mut votes_backup) = Muxer::builder(context.child("vote_mux"), votes_net.0, votes_net.1, 1024).with_backup().build();
+        mux.start();
+        let (mux, mut certs_mux, mut certs_backup) = Muxer::builder(context.child("cert_mux"), certs_net.0, certs_net.1, 1024).with_backup().build();
+        mux.start();
+        let (mux, mut resolver_mux) = Muxer::new(context.child("resolver_mux"), resolver_net.0, resolver_net.1, 1024);
+        mux.start();
+
+        let app = Inline::new(context.child("inline"), App { chain: chain.clone(), block_time_ms }, marshal.clone(), FixedEpocher::new(epoch_len));
+        let bt = Duration::from_millis(block_time_ms);
+        let (mut epoch, height) = {
+            let c = chain.lock();
+            (c.state.params.epoch_of(c.height() + 1), c.height())
+        };
+        let _ = height;
+        let mut tracked = None;
+        let mut active: Option<Handle<()>> = None;
         loop {
-            let Ok((from, msg)) = receiver.recv().await else { break };
-            let raw: Vec<u8> = msg.as_ref().to_vec();
-            if raw.len() > MAX_TX_BYTES {
-                continue;
+            // (Re)enter `epoch`.
+            if let Some(h) = active.take() {
+                h.abort();
             }
-            let Ok(tx) = serde_json::from_slice::<Tx>(&raw) else {
-                debug!(?from, "unparseable gossiped tx");
-                continue;
+            let Some(scheme) = provider.epoch_scheme(epoch) else {
+                error!(epoch, "no validator set known for epoch");
+                return;
             };
-            let mut c = chain.lock();
-            // Don't echo gossip back out; the originator already sent it to everyone.
-            let g = c.gossip.take();
-            if let Err(e) = c.submit_tx(tx) {
-                debug!(error = %e, "dropping gossiped tx");
+            if tracked.is_none_or(|t| t < epoch) {
+                let primary = scheme.participants().clone();
+                let secondary = provider.candidates();
+                let mut m = peers.clone();
+                let _ = m.track(epoch, TrackedPeers::new(primary, secondary));
+                tracked = Some(epoch);
             }
-            c.gossip = g;
+            let floor_digest = if epoch == 0 {
+                genesis.digest()
+            } else {
+                let c = chain.lock();
+                let h = c.state.params.last_of(epoch - 1);
+                Digest(hex_32(&c.block(h).map(|b| b.hash).unwrap_or_default()))
+            };
+            let voting = scheme.me().is_some();
+            let engine = simplex::Engine::new(
+                context.child("simplex").with_attribute("epoch", epoch),
+                simplex::config::Config {
+                    scheme: scheme.as_ref().clone(),
+                    elector: RoundRobin::<Blake3>::default(),
+                    blocker: blocker.clone(),
+                    automaton: app.clone(),
+                    relay: app.clone(),
+                    reporter: Reporters::from((marshal.clone(), certs.clone())),
+                    strategy: Sequential,
+                    partition: format!("{prefix}-simplex-{epoch}"),
+                    mailbox_size: NZUsize!(1024),
+                    epoch: Epoch::new(epoch),
+                    floor: simplex::config::Floor::Genesis(floor_digest),
+                    replay_buffer: NonZeroUsize::new(IO_BUFFER).unwrap(),
+                    write_buffer: NonZeroUsize::new(IO_BUFFER).unwrap(),
+                    page_cache: page_cache.clone(),
+                    leader_timeout: bt + Duration::from_secs(2),
+                    certification_timeout: bt + Duration::from_secs(3),
+                    timeout_retry: Duration::from_secs(5),
+                    fetch_timeout: Duration::from_secs(2),
+                    view_retention: ViewDelta::new(10),
+                    skip: SkipPolicy::Enabled { timeout: bt * 10 + Duration::from_secs(10), budget: SkipBudget::Participants },
+                    forward: ForwardPolicy::Disabled,
+                    track_historical_votes: false,
+                },
+            );
+            let (Ok(v), Ok(c), Ok(r)) = (votes.register(epoch).await, certs_mux.register(epoch).await, resolver_mux.register(epoch).await) else {
+                error!(epoch, "consensus mux closed");
+                return;
+            };
+            active = Some(engine.start(v, c, r));
+            info!(epoch, voting, validators = scheme.participants().len(), "entered epoch");
+
+            // Wait for the boundary of this epoch (or hints that we're behind).
+            loop {
+                commonware_macros::select! {
+                    next = epoch_rx.next() => {
+                        let Some(mut next) = next else { return };
+                        while let Ok(Some(n)) = epoch_rx.try_recv().map(Some) {
+                            next = next.max(n);
+                        }
+                        if next > epoch {
+                            epoch = next;
+                            break;
+                        }
+                    },
+                    msg = votes_backup.recv() => {
+                        let Some((their, (from, _))) = msg else { return };
+                        hint_behind(&marshal, &chain, epoch, their, from);
+                    },
+                    msg = certs_backup.recv() => {
+                        let Some((their, (from, _))) = msg else { return };
+                        hint_behind(&marshal, &chain, epoch, their, from);
+                    },
+                }
+            }
         }
     });
     let mailbox = marshal_rx.await.expect("marshal started");
     (handle, mailbox)
 }
 
-fn archive_config<C>(prefix: &str, name: &str, page_cache: CacheRef, codec_config: C) -> immutable::Config<C> {
-    immutable::Config {
+/// A peer is voting in a later epoch: we're behind. Ask marshal for the finalization of our
+/// epoch's last block (from that peer); backfill + execution then drive the transition.
+fn hint_behind(marshal: &MarshalMailbox, chain: &Shared, ours: u64, theirs: u64, from: PublicKey) {
+    if theirs <= ours {
+        return;
+    }
+    let last = chain.lock().state.params.last_of(ours);
+    debug!(ours, theirs, last, "peer is in a later epoch; fetching boundary");
+    marshal.hint_finalized(Height::new(last), commonware_utils::vec::NonEmptyVec::new(from));
+}
+
+/// Finalized blocks/certificates marshal keeps; older ones are pruned (our own `cblocks.bin` and
+/// checkpoint certificates keep serving history over HTTP).
+pub const MARSHAL_RETAIN: u64 = 2_000;
+/// Bumped when the on-disk consensus storage layout changes.
+pub const STORAGE_VERSION: &str = "prunable-v2";
+
+fn archive_config<C>(prefix: &str, name: &str, page_cache: CacheRef, codec_config: C) -> prunable::Config<TwoCap, C> {
+    prunable::Config {
+        translator: TwoCap,
         metadata_partition: format!("{prefix}-{name}-metadata"),
-        freezer_table_partition: format!("{prefix}-{name}-freezer-table"),
-        freezer_table_initial_size: 64,
-        freezer_table_resize_frequency: 10,
-        freezer_table_resize_chunk_size: 10,
-        freezer_key_partition: format!("{prefix}-{name}-freezer-key"),
-        freezer_key_page_cache: page_cache,
-        freezer_value_partition: format!("{prefix}-{name}-freezer-value"),
-        freezer_value_target_size: 1 << 20,
-        freezer_value_compression: None,
-        ordinal_partition: format!("{prefix}-{name}-ordinal"),
-        items_per_section: NZU64!(1024),
+        key_partition: format!("{prefix}-{name}-key"),
+        key_page_cache: page_cache,
+        value_partition: format!("{prefix}-{name}-value"),
+        compression: Some(3),
         codec_config,
-        replay_buffer: NZUsize!(1 << 20),
-        freezer_key_write_buffer: NZUsize!(1 << 20),
-        freezer_value_write_buffer: NZUsize!(1 << 20),
-        ordinal_write_buffer: NZUsize!(1 << 20),
+        items_per_section: NZU64!(256),
+        key_write_buffer: NonZeroUsize::new(IO_BUFFER).unwrap(),
+        value_write_buffer: NonZeroUsize::new(IO_BUFFER).unwrap(),
+        replay_buffer: NonZeroUsize::new(IO_BUFFER).unwrap(),
     }
 }
 
-pub fn quota() -> commonware_runtime::Quota {
-    commonware_runtime::Quota::per_second(NonZeroU32::new(10_000).unwrap())
+/// Per-peer message rate per channel. Commonware preallocates each channel's inbound mailbox
+/// as (retained peers × burst) slots, so these (with `MAX_PEERS_PER_SET` and
+/// `TRACKED_PEER_SETS`) bound p2p memory. 10,000/s × 1,027 peers was a ~470 MiB allocation per
+/// channel — enough to abort a 512 MB VM at startup.
+pub fn quota(channel: u64) -> commonware_runtime::Quota {
+    commonware_runtime::Quota::per_second(NonZeroU32::new(rate(channel)).unwrap())
+}
+
+fn rate(channel: u64) -> u32 {
+    match channel {
+        CH_VOTES | CH_CERTS | CH_RESOLVER => 50,
+        CH_BACKFILL => 100,
+        CH_BLOCKS => 20,
+        _ => 200, // mempool gossip
+    }
+}
+
+/// Peers per tracked set (active + approved validators, with headroom over the 32 cap).
+pub const MAX_PEERS_PER_SET: usize = 64;
+/// Peer sets the p2p layer keeps (current and previous epoch).
+pub const TRACKED_PEER_SETS: usize = 2;
+/// Bytes per preallocated inbound mailbox slot (observed: 48 on 64-bit targets).
+pub const MAILBOX_SLOT_BYTES: usize = 48;
+
+/// Upper bound on preallocated p2p inbound mailbox memory for `bootstrappers` extra peers.
+pub fn p2p_mailbox_bytes(bootstrappers: usize) -> usize {
+    let retained = MAX_PEERS_PER_SET * TRACKED_PEER_SETS + bootstrappers;
+    CHANNELS.iter().map(|c| retained * rate(*c) as usize * MAILBOX_SLOT_BYTES).sum()
+}
+
+/// Logs what the node is about to allocate up front.
+pub fn log_memory_budget(bootstrappers: usize) {
+    info!(
+        p2p_mailboxes_mib = p2p_mailbox_bytes(bootstrappers) / (1 << 20),
+        page_cache_mib = (PAGE_SIZE as usize * PAGE_CACHE_PAGES) / (1 << 20),
+        journal_buffers_mib = (IO_BUFFER * 12) / (1 << 20),
+        max_message_mib = MAX_MESSAGE_SIZE as usize / (1 << 20),
+        "memory budget"
+    );
+}
+
+pub const PAGE_SIZE: u16 = 4096;
+pub const PAGE_CACHE_PAGES: usize = 1024;
+/// Replay/write buffer per journal (marshal + simplex archives).
+pub const IO_BUFFER: usize = 256 * 1024;
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn p2p_preallocation_fits_a_small_vm() {
+        // 32 validators bootstrapping from each other.
+        let bytes = p2p_mailbox_bytes(64);
+        assert!(bytes < 32 << 20, "p2p mailboxes would preallocate {} MiB", bytes >> 20);
+        // The old settings (10,000/s, 256 peers × 4 sets) were ~470 MiB per channel.
+        assert!(1027 * 10_000 * MAILBOX_SLOT_BYTES > 400 << 20);
+    }
 }

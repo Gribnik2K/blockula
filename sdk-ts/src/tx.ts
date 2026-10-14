@@ -9,7 +9,18 @@ export type Action =
   | { type: "transfer"; to: string; amount: string }
   | { type: "register_name"; name: string }
   | { type: "add_key"; key_id: string; label: string; role: KeyRole }
-  | { type: "remove_key"; key_id: string };
+  | { type: "remove_key"; key_id: string }
+  /** Bond `bond` drops and offer `consensus_key` (hex ML-DSA-65 public key) as a validator. */
+  | {
+      type: "register_validator"; consensus_key: string; p2p_addr: string; http_addr: string; bond: string;
+      /** Proof of possession: the consensus key's ML-DSA-65 signature over `popMessage(...)` with context `POP_CONTEXT` (see `blockula validator pop`). */
+      pop: string;
+    }
+  /** Season 0 allowlist (admin accounts only). */
+  | { type: "approve_validator"; validator: string }
+  | { type: "remove_validator"; validator: string }
+  /** Reclaim the bond of a removed validator you own, one epoch after it left. */
+  | { type: "unbond"; validator: string };
 
 export interface UnsignedTx {
   chain_id: string;
@@ -65,8 +76,31 @@ export function signingBytes(tx: UnsignedTx): Uint8Array {
     case "remove_key":
       w.u8(3); w.str(a.key_id);
       break;
+    case "register_validator":
+      w.u8(4); w.str(a.consensus_key); w.str(a.p2p_addr); w.str(a.http_addr); w.u64(BigInt(a.bond)); w.str(a.pop);
+      break;
+    case "approve_validator":
+      w.u8(5); w.str(a.validator);
+      break;
+    case "remove_validator":
+      w.u8(6); w.str(a.validator);
+      break;
+    case "unbond":
+      w.u8(7); w.str(a.validator);
+      break;
   }
   w.str(tx.memo);
+  return w.done();
+}
+
+/** FIPS 204 context string for validator proofs of possession (node/src/types.rs `POP_CONTEXT`). */
+export const POP_CONTEXT = utf8.encode("blockula/validator-pop/v1");
+
+/** What a validator's consensus key signs to register (node/src/types.rs `pop_message`). */
+export function popMessage(chainId: string, owner: string, p2pAddr: string, httpAddr: string): Uint8Array {
+  const w = new Writer();
+  w.bytes(utf8.encode("BLOCKULA_VALIDATOR_POP_V1"));
+  for (const s of [chainId, owner, p2pAddr, httpAddr]) w.str(s);
   return w.done();
 }
 

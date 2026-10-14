@@ -9,8 +9,13 @@ import { Client, Wallet } from "./index.js";
 
 const PRF_SALT = new TextEncoder().encode("blockula/wallet/v1");
 
-function rpId() {
-  return location.hostname;
+/**
+ * The WebAuthn relying-party id. Passkeys (and so wallets) are bound to it: a wallet created
+ * under one rpId can't be unlocked under another. Pin it to your production domain; it must be
+ * the page's hostname or a registrable parent of it.
+ */
+function rpId(explicit?: string) {
+  return explicit ?? location.hostname;
 }
 
 type PrfResults = { prf?: { enabled?: boolean; results?: { first?: ArrayBuffer } } };
@@ -31,10 +36,10 @@ async function prfFromCredential(cred: PublicKeyCredential | null): Promise<Uint
 }
 
 /** Create a new passkey and the wallet it unlocks. */
-export async function createPasskeyWallet(opts: { username: string; client?: Client; rpName?: string }): Promise<Wallet> {
+export async function createPasskeyWallet(opts: { username: string; client?: Client; rpName?: string; rpId?: string }): Promise<Wallet> {
   const cred = (await navigator.credentials.create({
     publicKey: {
-      rp: { id: rpId(), name: opts.rpName ?? "Blockula" },
+      rp: { id: rpId(opts.rpId), name: opts.rpName ?? "Blockula" },
       user: { id: crypto.getRandomValues(new Uint8Array(16)), name: opts.username, displayName: opts.username },
       challenge: crypto.getRandomValues(new Uint8Array(32)),
       pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -8 }, { type: "public-key", alg: -257 }],
@@ -47,15 +52,15 @@ export async function createPasskeyWallet(opts: { username: string; client?: Cli
   // when the authenticator said PRF is enabled, so PRF-less providers fail fast with one prompt.
   const ext = cred?.getClientExtensionResults() as PrfResults | undefined;
   if (ext?.prf?.results?.first) return walletFrom(cred, new Uint8Array(ext.prf.results.first), opts.client);
-  if (ext?.prf?.enabled) return unlockPasskeyWallet({ client: opts.client, credentialId: cred ? new Uint8Array(cred.rawId) : undefined });
+  if (ext?.prf?.enabled) return unlockPasskeyWallet({ client: opts.client, rpId: opts.rpId, credentialId: cred ? new Uint8Array(cred.rawId) : undefined });
   return walletFrom(cred, await prfFromCredential(cred), opts.client);
 }
 
 /** Unlock an existing passkey wallet (shows the OS passkey picker). */
-export async function unlockPasskeyWallet(opts: { client?: Client; credentialId?: Uint8Array } = {}): Promise<Wallet> {
+export async function unlockPasskeyWallet(opts: { client?: Client; credentialId?: Uint8Array; rpId?: string } = {}): Promise<Wallet> {
   const cred = (await navigator.credentials.get({
     publicKey: {
-      rpId: rpId(),
+      rpId: rpId(opts.rpId),
       challenge: crypto.getRandomValues(new Uint8Array(32)),
       userVerification: "required",
       allowCredentials: opts.credentialId ? [{ type: "public-key", id: opts.credentialId as BufferSource }] : [],

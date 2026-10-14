@@ -27,4 +27,10 @@ const wallet = await createPasskeyWallet({ username: "vlad" });
 
 Amounts are FANG strings (`"1.5"`) or bigint drops (1 FANG = 10⁹ drops). Every transaction result includes a plain-English `summary`.
 
+- `send("alice.boo", …)` resolves the name first and signs the **address**, so whoever you checked is exactly who gets paid.
+- Node errors throw `ApiError` (`.status`: 429 means rate limited). A transaction that fails at execution throws `TxFailedError` from `waitForTx`.
+- Pass `rpId` to `createPasskeyWallet`/`unlockPasskeyWallet` to pin wallets to your production domain. Passkeys are bound to that hostname for good.
+
+The public testnet is `https://blockula-testnet.fly.dev`, and the wallet is https://blockula-wallet.vercel.app.
+
 ⚠️ Early and unaudited: test chains only.

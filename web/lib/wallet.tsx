@@ -96,7 +96,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = { client, ready, hint, wallet, account, status, refresh, unlocked, updateHint, lock, forget };
-  // Render client-side only: the node URL (?rpc=) and hints live in this browser, so server HTML
+  // Render client-side only: the chosen network and hints live in this browser, so server HTML
   // would disagree with the client on first paint.
   return <WalletCtx.Provider value={value}>{ready ? children : null}</WalletCtx.Provider>;
 }

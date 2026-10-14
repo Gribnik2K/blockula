@@ -1,23 +1,53 @@
-const DEFAULT_RPC = process.env.NEXT_PUBLIC_BLOCKULA_RPC || "http://localhost:7070";
-const RPC_KEY = "blockula.rpc";
-
 /**
- * Which node to talk to. `?rpc=https://node.example` switches nodes and is remembered in this
- * browser (`?rpc=default` resets), so one deployment works with a local node or any public one.
+ * Networks this wallet knows about. The node is chosen in the header (never from a link): a
+ * node controls what names resolve to and what balances look like, so switching it must be a
+ * deliberate act, and a custom node is flagged on every screen.
  */
-function resolveRpc(): string {
-  if (typeof window === "undefined") return DEFAULT_RPC;
+export const NETWORKS = {
+  testnet: { label: "Testnet", rpc: process.env.NEXT_PUBLIC_BLOCKULA_RPC || "https://blockula-testnet.fly.dev" },
+  local: { label: "Local node", rpc: "http://localhost:7070" },
+} as const;
+
+export type NetworkKey = keyof typeof NETWORKS | "custom";
+
+const NETWORK_KEY = "blockula.network";
+const CUSTOM_KEY = "blockula.customRpc";
+
+/** Blocks per day at Blockula's 1-second block time. Fixed here, not read from the node. */
+export const BLOCKS_PER_DAY = 86_400;
+
+/** Passkeys are bound to this hostname; wallets created elsewhere can't be unlocked here. */
+export const RP_ID = process.env.NEXT_PUBLIC_RP_ID || "blockula-wallet.vercel.app";
+
+function resolve(): { key: NetworkKey; label: string; rpc: string } {
+  const fallback = { key: "testnet" as const, ...NETWORKS.testnet };
+  if (typeof window === "undefined") return fallback;
   try {
-    const fromUrl = new URLSearchParams(window.location.search).get("rpc");
-    if (fromUrl === "default") localStorage.removeItem(RPC_KEY);
-    else if (fromUrl && /^https?:\/\/[^\s]+$/.test(fromUrl)) localStorage.setItem(RPC_KEY, fromUrl);
-    return localStorage.getItem(RPC_KEY) || DEFAULT_RPC;
+    const key = localStorage.getItem(NETWORK_KEY) as NetworkKey | null;
+    if (key === "local") return { key, ...NETWORKS.local };
+    if (key === "custom") {
+      const rpc = localStorage.getItem(CUSTOM_KEY);
+      if (rpc && /^https?:\/\/[^\s]+$/.test(rpc)) return { key, label: "Custom node", rpc };
+    }
+    // Default to the local node during local development.
+    if (!key && ["localhost", "127.0.0.1"].includes(window.location.hostname) && !process.env.NEXT_PUBLIC_BLOCKULA_RPC) {
+      return { key: "local", ...NETWORKS.local };
+    }
   } catch {
-    return DEFAULT_RPC;
+    /* storage unavailable */
   }
+  return fallback;
 }
 
-export const RPC = resolveRpc().replace(/\/$/, "");
+export const NETWORK = resolve();
+export const RPC = NETWORK.rpc.replace(/\/$/, "");
+
+/** Switch networks (from the header menu only) and reload so nothing mixes state across chains. */
+export function setNetwork(key: NetworkKey, customRpc?: string) {
+  localStorage.setItem(NETWORK_KEY, key);
+  if (key === "custom" && customRpc) localStorage.setItem(CUSTOM_KEY, customRpc);
+  window.location.assign("/");
+}
 
 export const explorer = {
   home: () => `${RPC}/#/`,
