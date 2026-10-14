@@ -1,0 +1,31 @@
+name: CI
+on:
+  push: { branches: [main] }
+  pull_request:
+
+jobs:
+  node:
+    name: Node (Rust tests + local multi-validator testnet)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: node }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: cargo test --release --manifest-path node/Cargo.toml
+      - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp
+      - name: 4 validators + full node + SDK e2e + CLI
+        run: bash scripts/local-testnet.sh
+
+  web:
+    name: Packages + wallet build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp && npm run build -w @blockula/web

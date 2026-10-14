@@ -7,15 +7,16 @@
 //   BLOCKULA_HOME       where the agent wallet lives (default ~/.blockula)
 //   BLOCKULA_MAX_SEND   max FANG per send() call (default 100)
 //   BLOCKULA_MAX_DAILY  max FANG this MCP sends per UTC day, across calls (default 100)
-//   BLOCKULA_BIN        path to the `blockula` binary (default: found on PATH)
+//   BLOCKULA_BIN        path to the `blockula` binary (default: ~/.blockula/bin/blockula from install_node, else PATH)
 // When acting for a user's account via a session key, the chain also enforces that key's limit.
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { Client, Wallet, formatFang, parseFang } from "@blockula/sdk";
 import { spawn, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { createHash } from "node:crypto";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 
@@ -27,7 +28,20 @@ const MAX_SEND = parseFang(process.env.BLOCKULA_MAX_SEND ?? "100");
 const MAX_DAILY = parseFang(process.env.BLOCKULA_MAX_DAILY ?? "100");
 const SPEND_FILE = join(HOME, "agent-spend.json");
 const VERSION: string = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
-const BIN = process.env.BLOCKULA_BIN ?? "blockula";
+const REPO = "jackdishman/blockula";
+const INSTALLED_BIN = join(HOME, "bin", "blockula");
+let BIN = process.env.BLOCKULA_BIN ?? (existsSync(INSTALLED_BIN) ? INSTALLED_BIN : "blockula");
+
+function releaseTarget(): string | null {
+  const key = `${process.platform}-${process.arch}`;
+  return ({ "darwin-arm64": "aarch64-apple-darwin", "darwin-x64": "x86_64-apple-darwin", "linux-x64": "x86_64-unknown-linux-gnu", "linux-arm64": "aarch64-unknown-linux-gnu" } as Record<string, string>)[key] ?? null;
+}
+
+async function download(url: string): Promise<Buffer> {
+  const res = await fetch(url, { redirect: "follow" });
+  if (!res.ok) throw new Error(`download failed (${res.status}): ${url}`);
+  return Buffer.from(await res.arrayBuffer());
+}
 
 async function reachable(url: string) {
   try {
@@ -130,9 +144,33 @@ tool("start_dev_node", "Start a local Blockula dev chain (faucet + built-in expl
     }
   }
   if (missing) {
-    throw new Error(`The \`${BIN}\` node binary isn't installed, so a local chain can't start. You're connected to ${RPC}${RPC === TESTNET_RPC ? " (the public testnet)" : ""}, which works for wallets, the faucet, names and sends. To run your own chain, build the node from the Blockula repo (cargo build --release) and set BLOCKULA_BIN.`);
+    throw new Error(`The \`${BIN}\` node binary isn't installed, so a local chain can't start. You're connected to ${RPC}${RPC === TESTNET_RPC ? " (the public testnet)" : ""}, which works for wallets, the faucet, names and sends. Call install_node to download the prebuilt node (checksum-verified), then start_dev_node again.`);
   }
   throw new Error(`node didn't start. See ${join(HOME, "dev-node.log")}`);
+});
+
+tool("install_node", "Download the prebuilt `blockula` node + CLI for this machine from the official GitHub release, verify its SHA-256 checksum, and install it to ~/.blockula/bin. Needed for start_dev_node and summon_chain; nothing else needs it.", { version: z.string().regex(/^(latest|v\d+\.\d+\.\d+)$/).default("latest") }, async ({ version }) => {
+  const target = releaseTarget();
+  if (!target) throw new Error(`No prebuilt node for ${process.platform}/${process.arch}. Build from source: https://github.com/${REPO}`);
+  const base = version === "latest" ? `https://github.com/${REPO}/releases/latest/download` : `https://github.com/${REPO}/releases/download/${version}`;
+  const asset = `blockula-${target}.tar.gz`;
+  const [tarball, sums] = await Promise.all([download(`${base}/${asset}`), download(`${base}/checksums.txt`)]);
+  const expected = sums.toString("utf8").split("\n").map((l) => l.trim().split(/\s+/)).find(([, f]) => f === asset)?.[0];
+  const actual = createHash("sha256").update(tarball).digest("hex");
+  if (!expected || expected !== actual) throw new Error(`checksum mismatch for ${asset}; not installing`);
+  const tmp = mkdtempSync(join(tmpdir(), "blockula-"));
+  try {
+    writeFileSync(join(tmp, asset), tarball);
+    execFileSync("tar", ["-xzf", join(tmp, asset), "-C", tmp]);
+    mkdirSync(join(HOME, "bin"), { recursive: true });
+    copyFileSync(join(tmp, `blockula-${target}`, "blockula"), INSTALLED_BIN);
+    chmodSync(INSTALLED_BIN, 0o755);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+  BIN = INSTALLED_BIN;
+  const installed = execFileSync(INSTALLED_BIN, ["--version"], { encoding: "utf8" }).trim();
+  return { installed, path: INSTALLED_BIN, sha256: actual, next: "start_dev_node runs a local chain; summon_chain creates your own network" };
 });
 
 tool("summon_chain", "Create a brand-new Blockula chain (fresh genesis + validator key) that you can run as your own network.", { chain_id: z.string().regex(/^[a-z0-9-]{3,40}$/), faucet: z.boolean().default(true) }, async ({ chain_id, faucet }) => {

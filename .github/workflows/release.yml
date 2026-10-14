@@ -1,0 +1,60 @@
+# Tag vX.Y.Z → prebuilt `blockula` binaries for macOS + Linux, with SHA-256 checksums,
+# attached to a GitHub release. scripts/install.sh and the MCP's install_node tool use them.
+name: Release
+on:
+  push: { tags: ["v*"] }
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, container: "rust:1-bookworm" }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, container: "rust:1-bookworm" }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        if: ${{ !matrix.container }}
+        uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      - name: Build
+        shell: bash
+        env: { BLOCKULA_GIT_SHA: "${{ github.sha }}" }
+        run: cargo build --release --locked --manifest-path node/Cargo.toml --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name=blockula-${{ matrix.target }}
+          mkdir -p dist/$name
+          cp node/target/${{ matrix.target }}/release/blockula dist/$name/
+          cp LICENSE README.md dist/$name/
+          tar -C dist -czf dist/$name.tar.gz $name
+          (cd dist && (sha256sum $name.tar.gz 2>/dev/null || shasum -a 256 $name.tar.gz) > $name.tar.gz.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blockula-${{ matrix.target }}
+          path: dist/blockula-${{ matrix.target }}.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: Checksums
+        run: cd dist && cat *.sha256 > checksums.txt && cat checksums.txt
+      - name: Publish release
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/checksums.txt scripts/install.sh \
+            --title "Blockula $GITHUB_REF_NAME" --generate-notes \
+            --notes "Install: \`curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sh\`"
