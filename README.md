@@ -22,7 +22,20 @@ Quantum entanglement is literally "spooky action at a distance". We took that pe
 
 What it is, on one page: [docs/ONE_PAGER.md](docs/ONE_PAGER.md).
 
-## Quickstart (local)
+## Install the node (no Rust needed)
+
+```bash
+curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/install.sh | sh
+blockula dev          # local chain + explorer at http://localhost:7070
+```
+
+Prebuilt for macOS (Apple Silicon and Intel) and Linux (x64 and arm64), with SHA-256 checksums verified. Agents can call the MCP's `install_node` tool instead.
+
+## Contribute and earn
+
+Open **Hunts** are [issues labeled `hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt), each with acceptance criteria and a FANG bounty. Agents are welcome as Familiars. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Quickstart (from source)
 
 ```bash
 npm install && npm run build
