@@ -39,7 +39,7 @@
 <header>
   <h1><a href="#/">🧛 Blockula</a></h1>
   <form id="search"><input id="q" placeholder="Search a name (jack.boo), address, block # or tx…" autocomplete="off" /></form>
-  <nav><a href="#/learn">📖 Learn</a><a href="#/">⛓️ Blocks</a><a href="#/validators">🧛 Validators</a><a href="#/mempool">⏳ Mempool</a></nav>
+  <nav><a href="#/learn">📖 Learn</a><a href="#/">⛓️ Blocks</a><a href="#/validators">🧛 Validators</a><a href="#/mempool">⏳ Mempool</a><a href="#/hunts">🏹 Hunts</a></nav>
 </header>
 <main id="app">Rising from the grave…</main>
 <script>
@@ -61,6 +61,8 @@ const GLOSSARY = {
   finalized: "Included in a block. On Blockula, once a block is sealed it's final — no waiting for confirmations.",
   epoch: "A stretch of blocks with a fixed validator set. Changes to the set (new validators, removals) only take effect when the next epoch starts.",
   bond: "FANG a validator locks up to take part. It can be reclaimed one epoch after the validator leaves.",
+  familiar: "An AI agent working for this account through a spend-limited session key. Its earnings go to the account that sponsors it.",
+  hunt: "A bounty on a GitHub issue. The FANG is locked in escrow until the creator (or a Season 0 admin) awards it for a pull request, or it's refunded to everyone who funded it.",
   proposer: "The validator that proposed this block. A 2/3+ quorum of validators then voted (ML-DSA-65 signatures) to finalize it.",
   certificate: "The finality proof: ML-DSA-65 votes from a 2/3+ quorum of validators. Blocks finalized as an ancestor of a later block share that later block's certificate.",
   burned: "Fees destroyed forever. Burning offsets new issuance and ties the token's value to real network usage.",
@@ -78,12 +80,13 @@ const views = {
     return `
       <div class="card" style="margin-bottom:16px"><h2>${health.ok ? "🟢" : "🟠"} Network health</h2>
         <div class="grid">
-          <div class="stat"><div class="v">#${s.height}</div><div class="k">height${s.syncing ? ` · syncing to #${s.finalized_height}` : ""}</div></div>
+          <div class="stat"><div class="v">#${s.height}</div><div class="k">height${s.syncing ? ` · syncing… ${Math.floor((s.sync_progress || 0) * 100)}% of ~#${s.network_height_claimed}` : ""}</div></div>
           <div class="stat"><div class="v">${age == null ? "—" : age + "s"}</div><div class="k">since the last block</div></div>
           <div class="stat"><div class="v">${s.active_validators}</div><div class="k"><a href="#/validators">validators</a> in ${term("epoch")} ${s.epoch}</div></div>
           <div class="stat"><div class="v">${s.mempool}</div><div class="k"><a href="#/mempool">pending txs</a></div></div>
         </div>
         ${health.ok ? "" : `<div class="dim">${esc(health.reason || "")}</div>`}
+        ${s.history_from > 1 ? `<div class="dim">⚡ This node fast-synced from a certified snapshot at #${s.fast_synced_from}; history before #${s.history_from} isn't available on this node.</div>` : ""}
         ${v ? `<div class="dim">${v.blocks_until_next_epoch} blocks until epoch ${v.epoch + 1}${v.pending.length ? ` · ${v.pending.length} validator${v.pending.length == 1 ? "" : "s"} awaiting approval` : ""}</div>` : ""}
       </div>`
       + `
@@ -140,9 +143,19 @@ const views = {
   },
   async account(id) {
     const a = await api("/account/" + encodeURIComponent(id));
+    let gh = null;
+    if (a.github) gh = await api("/github/" + encodeURIComponent(a.github.handle)).catch(() => null);
+    const bits = [esc(a.account.name || "Unnamed account")];
+    if (a.github) bits.push(`GitHub <a href="https://github.com/${esc(a.github.handle)}">@${esc(a.github.handle)}</a> ${gh && gh.verified ? `<span class="pill" title="${esc(gh.reason)}">✓ verified</span>` : `<span class="pill pending" title="${esc(gh ? gh.reason : "not checked")}">unverified</span>`}`);
+    if (a.hunts_won.length) bits.push(`${a.hunts_won.length} hunt${a.hunts_won.length == 1 ? "" : "s"} won`);
+    if (a.familiars.length) bits.push(`${a.familiars.length} ${term("familiar", a.familiars.length == 1 ? "Familiar" : "Familiars")}`);
     return `
-      <div class="card"><div class="summary">${esc(a.account.name || "Unnamed account")}</div>
+      <div class="card"><div class="summary">${bits.join(" · ")}</div>
         <div class="dim">${term("address")}: <span class="mono">${esc(a.account.address)}</span></div></div><br>
+      ${a.hunts_won.length || a.familiars.length || a.hunts_created.length ? `<div class="card"><h2>🏹 Hunts</h2>
+        ${a.hunts_won.map((h) => `<div class="row"><div><a href="#/hunt/${h.id}">${esc(h.repo)}#${h.issue}</a> won ${esc(h.amount_display)} for PR #${h.pr}${h.self_awarded ? ' <span class="pill pending">self-awarded</span>' : ""}</div></div>`).join("")}
+        ${a.hunts_created.length ? `<div class="dim">Created ${a.hunts_created.map((id) => `<a href="#/hunt/${id}">#${id}</a>`).join(", ")}</div>` : ""}
+        ${a.familiars.length ? `<div class="dim">Familiars: ${a.familiars.map((f) => `🐈‍⬛ ${esc(f.label)}`).join(", ")}</div>` : ""}</div><br>` : ""}
       <div class="grid">
         <div class="card stat"><div class="v">${esc(a.balance_display)}</div><div class="k">balance</div></div>
         <div class="card stat"><div class="v">${a.nonce}</div><div class="k">${term("nonce", "transactions sent")}</div></div>
@@ -167,6 +180,28 @@ const views = {
       <li><b>Coming soon: 👻 Ghost Mode.</b> Private transfers using zero-knowledge proofs (hash-based STARKs, also quantum-safe). The explorer will show <i>that</i> something happened, but not who or how much.</li>
     </ol><p>Try it: search for a name above, or open the <a href="#/">latest blocks</a> and click around. Every dotted word has an explanation if you hover.</p></div>`;
   },
+};
+
+views.hunts = async function () {
+  const r = await api("/hunts");
+  const row = (h) => `<div class="row"><div><a href="#/hunt/${h.id}"><b>${esc(h.amount_display)}</b> · ${esc(h.title)}</a>
+    <span class="dim">· <a href="${esc(h.issue_url)}">${esc(h.repo)}#${h.issue}</a> · ${h.funders.length} funder${h.funders.length == 1 ? "" : "s"}</span></div><span class="pill ${h.status == "open" ? "" : "pending"}">${esc(h.status)}</span></div>`;
+  return `<div class="card learn"><h2>🏹 Hunts</h2><p>${term("hunt", "Hunts")} are bounties on GitHub issues. Anyone can add to one. Fix the issue, get the pull request merged, and the bounty is awarded to your account (or to your ${term("familiar", "Familiar")}'s sponsor). Open bounties right now: <b>${esc(r.open_bounties_display)}</b>.</p>
+    <p class="dim">Put one up with the SDK: <span class="mono">wallet.createHunt({ repo: "owner/name", issue: 12, amount: "50", title: "…", expiresInBlocks: 100000 })</span></p></div><br>
+    <div class="card"><h2>All hunts (${r.count})</h2>${r.hunts.length ? r.hunts.map(row).join("") : '<div class="dim">No hunts yet.</div>'}</div>`;
+};
+
+views.hunt = async function (id) {
+  const h = await api("/hunt/" + id);
+  return `<div class="card"><div class="summary">🏹 ${esc(h.amount_display)} for <a href="${esc(h.issue_url)}">${esc(h.repo)}#${h.issue}</a></div>
+      <p>“${esc(h.title)}”</p><span class="pill ${h.status == "open" ? "" : "pending"}">${esc(h.status)}</span></div><br>
+    <div class="card"><dl>
+      <dt>Created by</dt><dd>${who(h.creator)} at block <a href="#/block/${h.created_at}">#${h.created_at}</a></dd>
+      <dt>Expires</dt><dd>block #${h.expires_at}</dd>
+      ${h.awarded_to ? `<dt>Winner</dt><dd>${who(h.awarded_to)}${h.familiar ? ` (via their ${term("familiar", "Familiar")} 🐈‍⬛ ${esc(h.familiar)})` : ""} for <a href="${esc(h.pr_url)}">PR #${h.pr}</a>${h.self_awarded ? ' <span class="pill pending">self-awarded</span>' : ""}</dd><dt>Awarded by</dt><dd>${who(h.awarded_by)} at block #${h.awarded_at}</dd>` : ""}
+      ${h.cancelled_at ? `<dt>Cancelled</dt><dd>block #${h.cancelled_at}; every funder was refunded what they put in</dd>` : ""}
+    </dl></div><br>
+    <div class="card"><h2>Funders (${h.funders.length})</h2>${h.funders.map((f) => `<div class="row"><div>${who(f.account)}</div><div>${esc(f.amount_display)}</div></div>`).join("")}</div>`;
 };
 
 views.mempool = async function () {

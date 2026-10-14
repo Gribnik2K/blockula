@@ -8,7 +8,7 @@ use crate::pq::{PrivateKey, PublicKey};
 use crate::types::*;
 use commonware_p2p::simulated::{Config as NetConfig, Link, Network, Oracle};
 use commonware_runtime::{Clock as _, Handle, Runner as _, Supervisor as _, deterministic};
-use commonware_codec::Decode as _;
+use commonware_codec::{Decode as _, DecodeExt as _};
 use commonware_consensus::simplex::types::Finalization;
 use commonware_cryptography::blake3::Digest;
 use commonware_utils::{NZUsize, probability};
@@ -298,4 +298,111 @@ fn count_signed(c: &Chain, epoch: u64, pk: &PublicKey, b: &Block, count: &mut us
     if f.certificate.signers.iter().any(|s| usize::from(s) == idx) {
         *count += 1;
     }
+}
+
+/// Fast sync: a fresh node verifies a certified snapshot (~height 300) against the validator-set
+/// history, rebuilds the state, then follows the chain with matching roots. Tampered manifests
+/// (bad chunk, bad root, forged certificate, wrong validator set) are rejected.
+#[test]
+fn fast_sync_from_certified_snapshot_and_tamper_rejection() {
+    use crate::snapshot;
+    let (root, homes, genesis, seeds) = summon("fast");
+    let joiner_home = root.join("joiner");
+    std::fs::create_dir_all(&joiner_home).unwrap();
+    std::fs::copy(homes[0].join("genesis.json"), joiner_home.join("genesis.json")).unwrap();
+
+    let executor = deterministic::Runner::timed(Duration::from_secs(3_000));
+    executor.start(|context| async move {
+        let mut oracle = network(&context, &genesis, &[]).await;
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
+            vals.push(start(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed)).await);
+        }
+        // Some activity so the snapshot isn't just genesis.
+        let funder = Keys::from_seed(seeds[0]);
+        for n in 0..5u64 {
+            vals[1].chain.lock().submit(transfer("sim", &funder, n, &Keys::from_seed([100 + n as u8; 32]).address(), DROPS_PER_FANG)).unwrap();
+        }
+        wait_for_height(&context, &vals, 3 * snapshot::CHECKPOINT_INTERVAL + snapshot::CHECKPOINT_DELAY + 2).await;
+        // Every checkpoint-certifying block committed to its checkpoint's root.
+        {
+            let c = vals[2].chain.lock();
+            for cp in [100u64, 200, 300] {
+                let b = crate::consensus::CBlock::decode(c.cblock(cp + snapshot::CHECKPOINT_DELAY).unwrap().as_slice()).unwrap();
+                assert_eq!(b.exec_height, cp);
+                assert_eq!(hex::encode(b.exec_root), c.root_at(cp).unwrap());
+            }
+        }
+        // Wait for validator 0's snapshot writer and certificate, then build the manifest.
+        let mut manifest = None;
+        for _ in 0..400 {
+            if let Ok(m) = snapshot::build_manifest(&vals[0].chain.lock()) {
+                if m.height >= 300 {
+                    manifest = Some(m);
+                    break;
+                }
+            }
+            context.sleep(Duration::from_millis(250)).await;
+        }
+        let m = manifest.expect("certified snapshot at 300");
+        let home0 = homes[0].clone();
+        let chunks: Vec<Vec<u8>> = (0..m.chunks.len()).map(|i| snapshot::chunk(&home0, m.height, i).unwrap()).collect();
+
+        // Tampering is caught.
+        let v = snapshot::verify_manifest(&genesis, &m).unwrap();
+        let mut bad = chunks.clone();
+        bad[0][10] ^= 1;
+        assert!(snapshot::restore(&genesis, &v, &bad).err().unwrap().to_string().contains("doesn't match"));
+        let mut wrong_root = m.clone();
+        wrong_root.state_root = "11".repeat(32);
+        assert!(snapshot::verify_manifest(&genesis, &wrong_root).err().unwrap().to_string().contains("commit"));
+        let mut forged = m.clone();
+        let mut f = hex::decode(&forged.finalization).unwrap();
+        let n = f.len();
+        f[n - 100] ^= 0xff;
+        forged.finalization = hex::encode(f);
+        assert!(snapshot::verify_manifest(&genesis, &forged).is_err(), "forged certificate");
+        let mut wrong_set = m.clone();
+        let fake: Vec<String> = (0..4u8).map(|i| hex::encode(commonware_cryptography::Signer::public_key(&PrivateKey::from_seed_bytes([200 + i; 32])).as_ref())).collect();
+        let mut fake_sorted = fake.clone();
+        fake_sorted.sort();
+        wrong_set.epochs.sets.insert(1, fake_sorted);
+        assert!(snapshot::verify_manifest(&genesis, &wrong_set).err().unwrap().to_string().contains("validator set"));
+        let mut lying_genesis = m.clone();
+        lying_genesis.epochs.sets.insert(0, fake);
+        assert!(snapshot::verify_manifest(&genesis, &lying_genesis).is_err());
+
+        // The honest manifest installs and the node follows the chain.
+        let state = snapshot::restore(&genesis, &v, &chunks).unwrap();
+        let joiner: Shared = Arc::new(Mutex::new(Chain::open(&joiner_home).unwrap()));
+        joiner.lock().install_snapshot(&v, state, &chunks.concat(), None).unwrap();
+        assert_eq!(joiner.lock().base_height(), m.height);
+        assert!(joiner.lock().block(m.height).is_none(), "no history before the snapshot");
+        let target = vals[0].chain.lock().height() + 20;
+        wait_for_height(&context, &vals, target).await;
+        // Follow with verified batches (the same path `join` uses over HTTP).
+        let provider = crate::consensus::EpochProvider::new(joiner.clone(), None);
+        while joiner.lock().height() < target {
+            let from = joiner.lock().height() + 1;
+            let c0 = vals[0].chain.lock();
+            let epoch = c0.state.params.epoch_of(from);
+            let end = c0.state.params.last_of(epoch).min(c0.height());
+            let to = (from..=end).find(|h| c0.cert(*h).is_some()).expect("a certificate in range");
+            let batch = crate::node::SyncBatch { tip: c0.height(), blocks: (from..=to).map(|h| hex::encode(c0.cblock(h).unwrap())).collect(), to: Some(to), finalization: Some(hex::encode(c0.cert(to).unwrap())) };
+            drop(c0);
+            let verifier = provider.epoch_scheme(epoch).unwrap();
+            crate::node::apply_batch(&joiner, &verifier, epoch, &batch).unwrap();
+        }
+        let h = joiner.lock().height();
+        assert_eq!(joiner.lock().root_at(h), vals[0].chain.lock().root_at(h));
+        assert_eq!(joiner.lock().state.account(&Keys::from_seed([104; 32]).address()).balance, DROPS_PER_FANG);
+        // Restart: the fast-synced home reopens from its base and replays what it executed since.
+        let root_now = joiner.lock().state.root();
+        drop(joiner);
+        let reopened = Chain::open(&joiner_home).unwrap();
+        assert_eq!(reopened.state.root(), root_now);
+        assert_eq!(reopened.height(), h);
+        println!("✓ fast-synced at #{} and followed to #{h} with matching roots", m.height);
+    });
+    std::fs::remove_dir_all(root).ok();
 }

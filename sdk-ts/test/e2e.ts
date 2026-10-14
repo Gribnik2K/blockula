@@ -76,5 +76,31 @@ if (minBond + parseFang("1") <= BigInt((await client.account(alice.address)).bal
   console.log(`(skipping validator registration: min bond ${vinfo.min_bond_display} exceeds the faucet drip)`);
 }
 
+// Hunts: bob escrows a bounty on a GitHub issue, alice chips in, bob awards it to alice's
+// Familiar (an agent session key she registered).
+const agent2 = Wallet.generate(client);
+await alice.addSessionKey(agent2.keyId, "claude", { limit: "1", periodBlocks: 100, expiresInBlocks: 1000 });
+console.log("✓", (await alice.registerFamiliar(agent2.keyId, "claude")).summary);
+const created = await bob.createHunt({ repo: "jackdishman/blockula", issue: 1, amount: "10", title: "Shared tx test vectors", expiresInBlocks: 500 });
+console.log("✓", created.summary);
+const huntId = (await client.account(bob.address)).hunts_created.at(-1);
+console.log("✓", (await alice.fundHunt(huntId, "1")).summary);
+await assert.rejects(alice.awardHunt(huntId, alice.address, 7), /creator or a validator admin/);
+const awarded = await bob.awardHunt(huntId, `${name}.boo`, 42, agent2.keyId);
+console.log("✓", awarded.summary);
+const h = await client.hunt(huntId);
+assert.equal(h.status, "awarded");
+assert.equal(h.amount_display, "11 FANG");
+assert.equal(h.familiar, "claude");
+assert.equal(h.pr_url, "https://github.com/jackdishman/blockula/pull/42");
+await assert.rejects(bob.cancelHunt(huntId), /already/);
+const prof = await client.account(alice.address);
+assert.equal(prof.hunts_won.length, 1);
+assert.equal(prof.familiars[0].label, "claude");
+// GitHub link: a claim on-chain, verified off-chain by the node (this gist id doesn't exist).
+console.log("✓", (await alice.linkGithub(`alice${Date.now() % 100000}`, "0123456789abcdef")).summary);
+assert.equal((await client.github((await client.account(alice.address)).github.handle)).verified, false);
+console.log("✓ hunts, Familiars and GitHub links work");
+
 const status = await client.status();
 console.log(`✓ all good at height ${status.height}, burned so far: ${status.burned_display}`);

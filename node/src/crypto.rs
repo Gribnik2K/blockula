@@ -69,6 +69,16 @@ impl Keys {
         Self::from_seed(seed)
     }
 
+    /// A second handle on the same key (re-derived from the seed).
+    #[cfg(test)]
+    pub fn clone_keys(&self) -> Self {
+        Self::from_seed(self.seed)
+    }
+
+    pub fn seed(&self) -> [u8; 32] {
+        self.seed
+    }
+
     pub fn seed_hex(&self) -> String {
         hex::encode(self.seed)
     }

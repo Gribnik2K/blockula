@@ -330,7 +330,6 @@ pub fn wallet(cmd: WalletCmd, dir: &Path) -> Result<()> {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -124,6 +124,22 @@ done
 echo "  $out"
 BLOCKULA_HOME="$W" "$BIN" wallet send "$NEWV" 1.5 --memo "cli wallet" --rpc "http://$V0"
 
+echo "— fast join from a certified snapshot"
+wait_height "$V0" 106
+FAST="127.0.0.1:$((FULL_PORT + 1))"
+"$BIN" join --genesis "http://$V0" --genesis-hash "$GHASH" --home "$DIR/fast" --port "$((FULL_PORT + 1))" >"$DIR/fast.log" 2>&1 &
+PIDS[$((N + 2))]=$!
+wait_height "$FAST" "$(status "$V0" | field .height)"
+from=$(status "$FAST" | field .fast_synced_from)
+[[ "$from" =~ ^[0-9]+$ && "$from" -ge 100 ]] || { echo "❌ fast join didn't start from a snapshot (fast_synced_from=$from)" >&2; cat "$DIR/fast.log" >&2; exit 1; }
+target=$(status "$V0" | field .height)
+wait_height "$FAST" "$target"
+a=$(curl -sf "http://$V0/api/block/$target" | field '.hash+" "+JSON.parse(s).state_root')
+b=$(curl -sf "http://$FAST/api/block/$target" | field '.hash+" "+JSON.parse(s).state_root')
+[[ "$a" == "$b" ]] || { echo "❌ fast-synced node disagrees at #$target" >&2; exit 1; }
+echo "✓ fast-synced from snapshot #$from and agrees with validators at #$target"
+NODES+=("$FAST")
+
 echo "— health and memory"
 for n in "${NODES[@]}"; do
   code=$(curl -s -o /dev/null -w '%{http_code}' "http://$n/api/health")

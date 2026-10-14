@@ -23,12 +23,12 @@
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/status` | chain id, height, supply, burned, version, git sha, genesis hash, epoch, sync state |
+| GET | `/api/status` | chain id, height, supply, burned, version, git sha, genesis hash, epoch, sync state (`syncing`, `sync_progress`, verified `finalized_height`, display-only `network_height_claimed`, `history_from`) |
 | GET | `/api/blocks?limit=&before=` | recent blocks |
 | GET | `/api/block/{height\|hash}` | block + txs |
 | GET | `/api/tx/{id}` | tx with `summary`, `status` (`pending`/`finalized`/`failed` + `error`) |
 | POST | `/api/tx` | submit signed tx JSON |
-| GET | `/api/account/{address\|name}` | balance, `next_nonce`, names, recent txs |
+| GET | `/api/account/{address\|name}` | balance, `next_nonce`, names, recent txs, `github`, `familiars`, hunts created/won |
 | GET | `/api/name/{name}` | availability + price, or owner |
 | GET | `/api/key/{key_id}` | accounts this key is authorized on |
 | GET | `/api/search/{q}` | `{type, id}` for anything |
@@ -37,6 +37,12 @@
 | GET | `/api/genesis` | the chain's genesis.json |
 | GET | `/api/sync?from=&limit=` | finalized consensus blocks + a finalization certificate (served by every node; used by `blockula join`) |
 | GET | `/api/mempool?limit=` | pending txs |
+| GET | `/api/hunts?status=` | Hunts (bounties on GitHub issues), biggest first; `open`/`awarded`/`cancelled`/`expired` |
+| GET | `/api/hunt/{id}` | one Hunt: repo#issue, bounty, funders, winner + PR, Familiar |
+| GET | `/api/github/{handle}` | off-chain check of a GitHub link (gist owned by the handle contains the account's address) |
+| GET | `/api/snapshot/latest` | newest certified state snapshot manifest (chunk hashes, certifying blocks + certificate, validator-set history) |
+| GET | `/api/snapshot/{height}/chunk/{i}` | snapshot chunk bytes |
+| GET | `/api/epochs` | validator-set history + handoff signatures |
 | GET | `/api/health` | 200 if the head is fresh and synced, else 503 + `reason` |
 | GET | `/metrics` | Prometheus: height, finalized lag, mempool, epoch, validators, faucet, tx counters |
 

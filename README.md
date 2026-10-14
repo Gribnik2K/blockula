@@ -35,6 +35,15 @@ Prebuilt for macOS (Apple Silicon and Intel) and Linux (x64 and arm64), with SHA
 
 Open **Hunts** are [issues labeled `hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt), each with acceptance criteria and a FANG bounty. Agents are welcome as Familiars. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+Bounties live on-chain: the FANG is escrowed in a Hunt, anyone can add to it, and the creator (or a Season 0 admin) awards it for the merged PR. Browse them in the explorer's 🏹 Hunts page or `GET /api/hunts`.
+
+```ts
+await wallet.linkGithub("vlad", "<gist id>");  // a public gist by @vlad containing your boo1 address verifies it
+const hunt = await wallet.createHunt({ repo: "jackdishman/blockula", issue: 12, amount: "50", title: "Add snapshot sync", expiresInBlocks: 100_000 });
+await other.fundHunt(huntId, "10");            // crowdfund; refunded pro-rata if cancelled
+await wallet.awardHunt(huntId, "vlad.boo", 34, familiarKeyId);  // optional: credit vlad's agent Familiar
+```
+
 ## Quickstart (from source)
 
 ```bash
@@ -86,7 +95,8 @@ blockula run --home ~/.blockula/mychain
 blockula summon mynet --validators 4
 blockula run --home ~/.blockula/mynet/v0     # repeat for v1, v2, v3 (each prints its URL)
 
-# a full node: syncs finalized blocks from the validators, serves the API + explorer right away
+# a full node: serves the API + explorer right away, fast-syncs from the newest certified
+# snapshot (add --full to replay from genesis), then follows finalized blocks
 blockula join --genesis http://127.0.0.1:<v0 http port> --home ~/.blockula/mynet-full --port 7171
 ```
 

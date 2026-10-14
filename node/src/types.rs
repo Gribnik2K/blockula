@@ -61,6 +61,39 @@ pub enum Action {
     RemoveValidator { validator: String },
     /// Owner reclaims the bond of a removed validator, one full epoch after it left.
     Unbond { validator: String },
+    /// Claim a GitHub handle for this account. Verified off-chain: a public gist owned by the
+    /// handle must contain the account's address (see `/api/github/{handle}`).
+    LinkGithub { handle: String, gist_id: String },
+    /// Drop a GitHub link (the holder, or a Season 0 admin to clear squatters).
+    UnlinkGithub { handle: String },
+    /// Put a bounty on a GitHub issue. `amount` is escrowed from the sender.
+    CreateHunt {
+        repo: String,
+        issue: u64,
+        #[serde(with = "u64_str")]
+        amount: u64,
+        expires_at: u64,
+        title: String,
+    },
+    /// Add to an open hunt's bounty (refunded pro-rata if the hunt is cancelled).
+    FundHunt {
+        hunt_id: u64,
+        #[serde(with = "u64_str")]
+        amount: u64,
+    },
+    /// Pay a hunt's escrow to `to` (address or name) for `pr`. Creator or Season 0 admin only.
+    AwardHunt {
+        hunt_id: u64,
+        to: String,
+        pr: u64,
+        /// Optional: the recipient's registered Familiar (agent session key) that did the work.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        familiar_key: Option<String>,
+    },
+    /// Refund a hunt's funders. Creator after `expires_at`, or a Season 0 admin any time.
+    CancelHunt { hunt_id: u64 },
+    /// Mark one of this account's session keys as an agent Familiar (shown on profiles/awards).
+    RegisterFamiliar { key_id: String, label: String },
 }
 
 /// What a key is allowed to do on an account.
@@ -162,6 +195,44 @@ impl Tx {
                 out.push(7);
                 put_str(&mut out, validator);
             }
+            Action::LinkGithub { handle, gist_id } => {
+                out.push(8);
+                put_str(&mut out, handle);
+                put_str(&mut out, gist_id);
+            }
+            Action::UnlinkGithub { handle } => {
+                out.push(9);
+                put_str(&mut out, handle);
+            }
+            Action::CreateHunt { repo, issue, amount, expires_at, title } => {
+                out.push(10);
+                put_str(&mut out, repo);
+                out.extend_from_slice(&issue.to_le_bytes());
+                out.extend_from_slice(&amount.to_le_bytes());
+                out.extend_from_slice(&expires_at.to_le_bytes());
+                put_str(&mut out, title);
+            }
+            Action::FundHunt { hunt_id, amount } => {
+                out.push(11);
+                out.extend_from_slice(&hunt_id.to_le_bytes());
+                out.extend_from_slice(&amount.to_le_bytes());
+            }
+            Action::AwardHunt { hunt_id, to, pr, familiar_key } => {
+                out.push(12);
+                out.extend_from_slice(&hunt_id.to_le_bytes());
+                put_str(&mut out, to);
+                out.extend_from_slice(&pr.to_le_bytes());
+                put_str(&mut out, familiar_key.as_deref().unwrap_or(""));
+            }
+            Action::CancelHunt { hunt_id } => {
+                out.push(13);
+                out.extend_from_slice(&hunt_id.to_le_bytes());
+            }
+            Action::RegisterFamiliar { key_id, label } => {
+                out.push(14);
+                put_str(&mut out, key_id);
+                put_str(&mut out, label);
+            }
         }
         put_str(&mut out, &self.memo);
         out
@@ -259,6 +330,45 @@ impl Tx {
                     bail!("validator must be a lowercase boo1… address");
                 }
             }
+            Action::LinkGithub { handle, gist_id } => {
+                check_github_handle(handle)?;
+                if gist_id.is_empty() || gist_id.len() > 64 || !gist_id.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_lowercase()) {
+                    bail!("gist_id must be the gist's id (lowercase letters and digits, up to 64)");
+                }
+            }
+            Action::UnlinkGithub { handle } => check_github_handle(handle)?,
+            Action::CreateHunt { repo, issue, title, .. } => {
+                check_repo(repo)?;
+                if *issue == 0 {
+                    bail!("issue must be a GitHub issue number");
+                }
+                check_title(title)?;
+            }
+            Action::FundHunt { .. } | Action::CancelHunt { .. } => {}
+            Action::AwardHunt { to, pr, familiar_key, .. } => {
+                if to.len() > MAX_NAME_FIELD {
+                    bail!("`to` too long");
+                }
+                if !crypto::is_address(to) {
+                    normalize_name(to).context("`to` must be a lowercase boo1… address or a .boo name")?;
+                }
+                if *pr == 0 {
+                    bail!("pr must be a pull request number");
+                }
+                if let Some(k) = familiar_key {
+                    if !key_id_ok(k) {
+                        bail!("familiar_key must be a key id (32 bytes of lowercase hex)");
+                    }
+                }
+            }
+            Action::RegisterFamiliar { key_id, label } => {
+                if !key_id_ok(key_id) {
+                    bail!("key_id must be 32 bytes of lowercase hex");
+                }
+                if label.is_empty() || label.len() > MAX_LABEL {
+                    bail!("familiar label must be 1–{MAX_LABEL} bytes");
+                }
+            }
         }
         Ok(())
     }
@@ -309,6 +419,35 @@ pub fn name_price(name: &str) -> u64 {
 }
 
 pub const MAX_TX_BYTES: usize = 64 * 1024;
+pub const MAX_HUNT_TITLE: usize = 96;
+pub const MIN_HUNT: u64 = 10 * DROPS_PER_FANG;
+pub const MIN_HUNT_FUNDING: u64 = DROPS_PER_FANG;
+
+/// GitHub login rules: 1–39 of a-z, A-Z, 0-9 and single hyphens, not starting/ending with '-'.
+pub fn check_github_handle(h: &str) -> Result<()> {
+    let ok = (1..=39).contains(&h.len()) && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') && !h.starts_with('-') && !h.ends_with('-') && !h.contains("--");
+    if !ok {
+        bail!("not a valid GitHub handle");
+    }
+    Ok(())
+}
+
+/// `owner/name` on GitHub.
+pub fn check_repo(repo: &str) -> Result<()> {
+    let Some((owner, name)) = repo.split_once('/') else { bail!("repo must be owner/name") };
+    check_github_handle(owner).context("repo owner")?;
+    if name.is_empty() || name.len() > 100 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) || name == "." || name == ".." {
+        bail!("bad repo name");
+    }
+    Ok(())
+}
+
+pub fn check_title(t: &str) -> Result<()> {
+    if t.trim().is_empty() || t.len() > MAX_HUNT_TITLE || t.chars().any(|c| c.is_control()) {
+        bail!("title must be 1–{MAX_HUNT_TITLE} bytes with no control characters");
+    }
+    Ok(())
+}
 pub const MAX_MEMO: usize = 256;
 pub const MAX_LABEL: usize = 64;
 pub const MAX_NAME_FIELD: usize = 64;

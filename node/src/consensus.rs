@@ -272,7 +272,11 @@ where
         if parent.height > exec_height {
             while pending.last().unwrap().height > exec_height + 1 {
                 if pending.len() > 64 {
-                    // Far behind (still catching up): propose an empty block rather than guess.
+                    // Far behind (still catching up): propose an empty block rather than guess
+                    // (but never at a checkpoint-certifying height, which needs the real root).
+                    if crate::snapshot::certifies(height).is_some() {
+                        return None;
+                    }
                     let c = self.chain.lock();
                     return Some(CBlock::new(parent.digest(), height, timestamp_ms, proposer, c.height(), hex_32(&c.state.root()), vec![]));
                 }
@@ -282,6 +286,7 @@ where
             pending.clear();
         }
         // Build on a journal over the live state (rolled back afterwards) — no state clone.
+        let (exec_height, exec_root, txs) = {
         let mut c = self.chain.lock();
         if c.height() != exec_height {
             // We executed more blocks meanwhile; drop the ones now executed.
@@ -321,7 +326,19 @@ where
             txs.push(raw);
         }
         c.state.rollback(j);
-        drop(c);
+        (exec_height, exec_root, txs)
+        };
+        // Checkpoint rule: the block at C + CHECKPOINT_DELAY must commit to state_root(C).
+        let (exec_height, exec_root) = match crate::snapshot::certifies(height) {
+            Some(cp) => match wait_executed(&ctx, &self.chain, cp, self.block_time_ms).await {
+                Some(root) => (cp, root),
+                None => {
+                    warn!(height, checkpoint = cp, "haven't executed the checkpoint yet; skipping this proposal");
+                    return None;
+                }
+            },
+            None => (exec_height, exec_root),
+        };
         debug!(height, txs = txs.len(), "proposing");
         Some(CBlock::new(parent.digest(), height, timestamp_ms, proposer, exec_height, exec_root, txs))
     }
@@ -346,6 +363,18 @@ where
         }
         if block.exec_height >= block.height {
             return reject("exec_height not below block height");
+        }
+        // Checkpoint rule: this block must commit to state_root(C), and we must have checked it
+        // ourselves before voting (wait briefly for execution rather than vote unchecked).
+        if let Some(cp) = crate::snapshot::certifies(block.height) {
+            if block.exec_height != cp {
+                return reject("checkpoint-certifying block must carry the checkpoint's exec_height");
+            }
+            match wait_executed(&ctx, &self.chain, cp, self.block_time_ms).await {
+                Some(root) if root == block.exec_root => {}
+                Some(_) => return reject("checkpoint state root mismatch"),
+                None => return reject("haven't executed the checkpoint yet; can't check its root"),
+            }
         }
         let chain_id = {
             let c = self.chain.lock();
@@ -380,6 +409,26 @@ where
             return reject("replays an already-finalized tx");
         }
         true
+    }
+}
+
+/// Waits (up to ~3 block times) until we've executed `height`; returns its state root.
+async fn wait_executed<E: Clock>(ctx: &E, chain: &Shared, height: u64, block_time_ms: u64) -> Option<[u8; 32]> {
+    let deadline = Duration::from_millis(3 * block_time_ms.max(200));
+    let step = Duration::from_millis(50);
+    let mut waited = Duration::ZERO;
+    loop {
+        {
+            let c = chain.lock();
+            if c.height() >= height {
+                return c.root_at(height).map(|r| hex_32(&r));
+            }
+        }
+        if waited >= deadline {
+            return None;
+        }
+        ctx.sleep(step).await;
+        waited += step;
     }
 }
 
@@ -726,7 +775,7 @@ where
             } else {
                 let c = chain.lock();
                 let h = c.state.params.last_of(epoch - 1);
-                Digest(hex_32(&c.block(h).map(|b| b.hash).unwrap_or_default()))
+                Digest(hex_32(&c.hash_at(h).unwrap_or_default()))
             };
             let voting = scheme.me().is_some();
             let engine = simplex::Engine::new(

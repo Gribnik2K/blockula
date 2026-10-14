@@ -148,6 +148,40 @@ export class Wallet {
     return this.client.submit(await this.build({ type: "remove_validator", validator }));
   }
 
+  /** Claim a GitHub handle. Verify it by creating a public gist (as that user) containing this account's address. */
+  async linkGithub(handle: string, gistId: string) {
+    return this.client.submit(await this.build({ type: "link_github", handle, gist_id: gistId }));
+  }
+
+  async unlinkGithub(handle: string) {
+    return this.client.submit(await this.build({ type: "unlink_github", handle }));
+  }
+
+  /** Put a bounty on a GitHub issue. `expiresInBlocks` from now (max ~1 year). */
+  async createHunt(opts: { repo: string; issue: number; amount: string | number | bigint; title: string; expiresInBlocks: number }) {
+    const { height } = await this.client.status();
+    return this.client.submit(await this.build({ type: "create_hunt", repo: opts.repo, issue: opts.issue, amount: parseFang(opts.amount).toString(), expires_at: height + opts.expiresInBlocks, title: opts.title }));
+  }
+
+  async fundHunt(huntId: number, amount: string | number | bigint) {
+    return this.client.submit(await this.build({ type: "fund_hunt", hunt_id: huntId, amount: parseFang(amount).toString() }));
+  }
+
+  /** Pay a hunt's bounty (creator or admin). `to` may be a .boo name; it's resolved and the address is signed. */
+  async awardHunt(huntId: number, to: string, pr: number, familiarKey?: string) {
+    const addr = await this.client.resolve(to);
+    return this.client.submit(await this.build({ type: "award_hunt", hunt_id: huntId, to: addr, pr, ...(familiarKey ? { familiar_key: familiarKey } : {}) }));
+  }
+
+  async cancelHunt(huntId: number) {
+    return this.client.submit(await this.build({ type: "cancel_hunt", hunt_id: huntId }));
+  }
+
+  /** Mark one of this account's session keys (an agent) as a Familiar. */
+  async registerFamiliar(keyIdHex: string, label: string) {
+    return this.client.submit(await this.build({ type: "register_familiar", key_id: keyIdHex, label }));
+  }
+
   /** Reclaim the bond of a removed validator this account owns. */
   async unbond(validator: string) {
     return this.client.submit(await this.build({ type: "unbond", validator }));
@@ -206,6 +240,11 @@ export class Client {
   search(q: string) { return this.call(`/search/${encodeURIComponent(q)}`); }
   /** Active set for the current epoch, pending/approved validators, next-epoch set, epoch timing. */
   validators() { return this.call("/validators"); }
+  /** Hunts (bounties on GitHub issues), biggest first. */
+  hunts(status?: "open" | "awarded" | "cancelled" | "expired") { return this.call(`/hunts${status ? `?status=${status}` : ""}`); }
+  hunt(id: number) { return this.call(`/hunt/${id}`); }
+  /** Off-chain check of a GitHub link (gist owned by the handle containing the address). */
+  github(handle: string) { return this.call(`/github/${encodeURIComponent(handle)}`); }
 
   async resolve(nameOrAddress: string): Promise<string> {
     if (isAddress(nameOrAddress)) return nameOrAddress;

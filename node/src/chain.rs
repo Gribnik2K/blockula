@@ -247,7 +247,12 @@ pub struct Journal {
     accounts: HashMap<String, Option<Account>>,
     names: HashMap<String, Option<NameRecord>>,
     validators: HashMap<String, Option<ValidatorRecord>>,
+    hunts: HashMap<u64, Option<Hunt>>,
+    github: HashMap<String, Option<GithubLink>>,
+    github_by_account: HashMap<String, Option<String>>,
+    familiars: HashMap<String, Option<BTreeMap<String, String>>>,
     scalars: Option<(u64, u64)>,
+    next_hunt_id: Option<u64>,
 }
 
 impl Journal {
@@ -266,8 +271,23 @@ impl Journal {
         for (k, v) in other.validators {
             self.validators.entry(k).or_insert(v);
         }
+        for (k, v) in other.hunts {
+            self.hunts.entry(k).or_insert(v);
+        }
+        for (k, v) in other.github {
+            self.github.entry(k).or_insert(v);
+        }
+        for (k, v) in other.github_by_account {
+            self.github_by_account.entry(k).or_insert(v);
+        }
+        for (k, v) in other.familiars {
+            self.familiars.entry(k).or_insert(v);
+        }
         if self.scalars.is_none() {
             self.scalars = other.scalars;
+        }
+        if self.next_hunt_id.is_none() {
+            self.next_hunt_id = other.next_hunt_id;
         }
     }
 }
@@ -284,7 +304,7 @@ pub fn free_port() -> Result<u16> {
     Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Account {
     #[serde(with = "u64_str")]
     pub balance: u64,
@@ -293,7 +313,7 @@ pub struct Account {
     pub keys: BTreeMap<String, KeyRecord>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KeyRecord {
     pub label: String,
     pub role: KeyRole,
@@ -306,14 +326,67 @@ pub struct KeyRecord {
 
 pub const MAX_KEYS: usize = 16;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NameRecord {
     pub name: String,
     pub owner: String,
     pub registered_at: u64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HuntStatus {
+    Open,
+    Awarded,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Hunt {
+    pub id: u64,
+    pub creator: String,
+    pub repo: String,
+    pub issue: u64,
+    pub title: String,
+    /// Total escrowed (creator + funders).
+    #[serde(with = "u64_str")]
+    pub amount: u64,
+    /// Contribution per funder (creator included), for pro-rata refunds.
+    pub funders: BTreeMap<String, String>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub status: HuntStatus,
+    pub awarded_to: Option<String>,
+    pub awarded_by: Option<String>,
+    pub awarded_at: Option<u64>,
+    pub pr: Option<u64>,
+    pub familiar_key: Option<String>,
+    pub cancelled_at: Option<u64>,
+}
+
+impl Hunt {
+    pub fn contribution(&self, who: &str) -> u64 {
+        self.funders.get(who).and_then(|v| v.parse().ok()).unwrap_or(0)
+    }
+    pub fn self_awarded(&self) -> bool {
+        self.awarded_to.as_deref() == Some(self.creator.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GithubLink {
+    pub handle: String,
+    pub account: String,
+    pub gist_id: String,
+    pub linked_at: u64,
+}
+
+/// Longest a hunt may run: ~1 year of blocks.
+pub fn max_hunt_blocks(block_time_ms: u64) -> u64 {
+    365 * 86_400 * 1000 / block_time_ms.max(1)
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct State {
     pub accounts: BTreeMap<String, Account>,
     pub names: BTreeMap<String, NameRecord>,
@@ -323,7 +396,21 @@ pub struct State {
     pub validators: BTreeMap<String, ValidatorRecord>,
     /// Active set per epoch (validator addresses), for the last `EPOCH_SETS_KEPT` epochs.
     pub active_sets: BTreeMap<u64, Vec<String>>,
+    #[serde(skip)]
     pub params: Params,
+    /// Hunts (bounties on GitHub issues) by id.
+    #[serde(default)]
+    pub hunts: BTreeMap<u64, Hunt>,
+    #[serde(default)]
+    pub next_hunt_id: u64,
+    /// GitHub links by lowercase handle, and the reverse.
+    #[serde(default)]
+    pub github: BTreeMap<String, GithubLink>,
+    #[serde(default)]
+    pub github_by_account: BTreeMap<String, String>,
+    /// Registered Familiars (agent session keys) per account: key id → label.
+    #[serde(default)]
+    pub familiars: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl State {
@@ -436,6 +523,29 @@ impl State {
         self.acct_mut(j, addr).balance += amount;
     }
 
+    fn hunt_mut(&mut self, j: &mut Journal, id: u64) -> Option<&mut Hunt> {
+        if !j.hunts.contains_key(&id) {
+            j.hunts.insert(id, self.hunts.get(&id).cloned());
+        }
+        self.hunts.get_mut(&id)
+    }
+
+    fn j_github(&mut self, j: &mut Journal, handle: &str, account: &str) {
+        if !j.github.contains_key(handle) {
+            j.github.insert(handle.to_string(), self.github.get(handle).cloned());
+        }
+        if !j.github_by_account.contains_key(account) {
+            j.github_by_account.insert(account.to_string(), self.github_by_account.get(account).cloned());
+        }
+    }
+
+    fn familiars_mut(&mut self, j: &mut Journal, account: &str) -> &mut BTreeMap<String, String> {
+        if !j.familiars.contains_key(account) {
+            j.familiars.insert(account.to_string(), self.familiars.get(account).cloned());
+        }
+        self.familiars.entry(account.to_string()).or_default()
+    }
+
     fn j_scalars(&mut self, j: &mut Journal) {
         if j.scalars.is_none() {
             j.scalars = Some((self.supply, self.burned));
@@ -477,6 +587,25 @@ impl State {
         if let Some((supply, burned)) = j.scalars {
             self.supply = supply;
             self.burned = burned;
+        }
+        fn restore<K: Ord, V>(map: &mut BTreeMap<K, V>, saved: HashMap<K, Option<V>>) {
+            for (k, old) in saved {
+                match old {
+                    Some(v) => {
+                        map.insert(k, v);
+                    }
+                    None => {
+                        map.remove(&k);
+                    }
+                }
+            }
+        }
+        restore(&mut self.hunts, j.hunts);
+        restore(&mut self.github, j.github);
+        restore(&mut self.github_by_account, j.github_by_account);
+        restore(&mut self.familiars, j.familiars);
+        if let Some(n) = j.next_hunt_id {
+            self.next_hunt_id = n;
         }
     }
 
@@ -630,6 +759,13 @@ impl State {
                     bail!("can't remove the last owner key — you'd lock yourself out");
                 }
                 self.acct_mut(j, &sender).keys = keys;
+                if self.familiars.get(&sender).is_some_and(|f| f.contains_key(key_id)) {
+                    let f = self.familiars_mut(j, &sender);
+                    f.remove(key_id);
+                    if f.is_empty() {
+                        self.familiars.remove(&sender);
+                    }
+                }
             }
             Action::RegisterValidator { consensus_key, p2p_addr, http_addr, bond, pop } => {
                 if key.role != KeyRole::Owner {
@@ -714,6 +850,143 @@ impl State {
                 v.status = ValidatorStatus::Unbonded;
                 self.j_credit(j, &sender, bond);
             }
+            Action::LinkGithub { handle, gist_id } => {
+                if key.role != KeyRole::Owner {
+                    bail!("only owner keys can link GitHub");
+                }
+                let lower = handle.to_ascii_lowercase();
+                if let Some(h) = self.github_by_account.get(&sender) {
+                    bail!("this account is already linked to @{h}; unlink it first");
+                }
+                if let Some(l) = self.github.get(&lower) {
+                    bail!("@{} is already linked to {}; it must be unlinked first", l.handle, short(&l.account));
+                }
+                self.j_github(j, &lower, &sender);
+                self.github.insert(lower.clone(), GithubLink { handle: handle.clone(), account: sender.clone(), gist_id: gist_id.clone(), linked_at: height });
+                self.github_by_account.insert(sender.clone(), lower);
+            }
+            Action::UnlinkGithub { handle } => {
+                let lower = handle.to_ascii_lowercase();
+                let link = self.github.get(&lower).cloned().ok_or_else(|| anyhow!("@{handle} isn't linked"))?;
+                let admin = self.params.admins.contains(&sender);
+                if link.account != sender && !admin {
+                    bail!("only the linked account or a validator admin can unlink @{handle}");
+                }
+                if link.account == sender && key.role != KeyRole::Owner {
+                    bail!("only owner keys can unlink GitHub");
+                }
+                self.j_github(j, &lower, &link.account);
+                self.github.remove(&lower);
+                self.github_by_account.remove(&link.account);
+            }
+            Action::CreateHunt { repo, issue, amount, expires_at, title } => {
+                if key.role != KeyRole::Owner {
+                    bail!("only owner keys can create hunts");
+                }
+                if *amount < MIN_HUNT {
+                    bail!("a hunt needs at least {}", fmt_fang(MIN_HUNT));
+                }
+                if *expires_at <= height {
+                    bail!("expires_at must be in the future");
+                }
+                if expires_at - height > max_hunt_blocks(self.params.block_time_ms) {
+                    bail!("hunts can run at most about a year ({} blocks)", max_hunt_blocks(self.params.block_time_ms));
+                }
+                self.j_debit(j, &sender, *amount)?;
+                if j.next_hunt_id.is_none() {
+                    j.next_hunt_id = Some(self.next_hunt_id);
+                }
+                let id = self.next_hunt_id;
+                self.next_hunt_id = id.checked_add(1).ok_or_else(|| anyhow!("hunt ids exhausted"))?;
+                j.hunts.entry(id).or_insert(None);
+                self.hunts.insert(
+                    id,
+                    Hunt { id, creator: sender.clone(), repo: repo.clone(), issue: *issue, title: title.clone(), amount: *amount, funders: BTreeMap::from([(sender.clone(), amount.to_string())]), created_at: height, expires_at: *expires_at, status: HuntStatus::Open, awarded_to: None, awarded_by: None, awarded_at: None, pr: None, familiar_key: None, cancelled_at: None },
+                );
+            }
+            Action::FundHunt { hunt_id, amount } => {
+                if *amount < MIN_HUNT_FUNDING {
+                    bail!("fund with at least {}", fmt_fang(MIN_HUNT_FUNDING));
+                }
+                let h = self.hunts.get(hunt_id).ok_or_else(|| anyhow!("no hunt #{hunt_id}"))?;
+                if h.status != HuntStatus::Open {
+                    bail!("hunt #{hunt_id} is {:?}, not open", h.status);
+                }
+                if height > h.expires_at {
+                    bail!("hunt #{hunt_id} expired at block {}", h.expires_at);
+                }
+                let total = h.amount.checked_add(*amount).ok_or_else(|| anyhow!("bounty overflow"))?;
+                let mine = h.contribution(&sender).checked_add(*amount).ok_or_else(|| anyhow!("bounty overflow"))?;
+                self.j_debit(j, &sender, *amount)?;
+                let h = self.hunt_mut(j, *hunt_id).unwrap();
+                h.amount = total;
+                h.funders.insert(sender.clone(), mine.to_string());
+            }
+            Action::AwardHunt { hunt_id, to, pr, familiar_key } => {
+                let h = self.hunts.get(hunt_id).ok_or_else(|| anyhow!("no hunt #{hunt_id}"))?;
+                if h.status != HuntStatus::Open {
+                    bail!("hunt #{hunt_id} is already {:?}", h.status);
+                }
+                let admin = self.params.admins.contains(&sender);
+                if h.creator != sender && !admin {
+                    bail!("only the hunt's creator or a validator admin can award it");
+                }
+                if h.creator == sender && key.role != KeyRole::Owner {
+                    bail!("only owner keys can award hunts");
+                }
+                let to = self.resolve(to)?;
+                if let Some(k) = familiar_key {
+                    if !self.familiars.get(&to).is_some_and(|f| f.contains_key(k)) {
+                        bail!("that key isn't a registered Familiar of {}", short(&to));
+                    }
+                }
+                let amount = h.amount;
+                self.j_credit(j, &to, amount);
+                let h = self.hunt_mut(j, *hunt_id).unwrap();
+                h.status = HuntStatus::Awarded;
+                h.awarded_to = Some(to);
+                h.awarded_by = Some(sender.clone());
+                h.awarded_at = Some(height);
+                h.pr = Some(*pr);
+                h.familiar_key = familiar_key.clone();
+            }
+            Action::CancelHunt { hunt_id } => {
+                let h = self.hunts.get(hunt_id).ok_or_else(|| anyhow!("no hunt #{hunt_id}"))?;
+                if h.status != HuntStatus::Open {
+                    bail!("hunt #{hunt_id} is already {:?}", h.status);
+                }
+                let admin = self.params.admins.contains(&sender);
+                if !admin {
+                    if h.creator != sender {
+                        bail!("only the hunt's creator (after it expires) or a validator admin can cancel it");
+                    }
+                    if height <= h.expires_at {
+                        bail!("hunt #{hunt_id} can be cancelled by its creator after block {}", h.expires_at);
+                    }
+                }
+                let refunds: Vec<(String, u64)> = h.funders.iter().map(|(a, v)| (a.clone(), v.parse().unwrap_or(0))).collect();
+                let total: u64 = refunds.iter().try_fold(0u64, |acc, (_, v)| acc.checked_add(*v)).ok_or_else(|| anyhow!("escrow overflow"))?;
+                if total != h.amount {
+                    bail!("escrow accounting mismatch on hunt #{hunt_id}");
+                }
+                for (who, v) in refunds {
+                    self.j_credit(j, &who, v);
+                }
+                let h = self.hunt_mut(j, *hunt_id).unwrap();
+                h.status = HuntStatus::Cancelled;
+                h.cancelled_at = Some(height);
+            }
+            Action::RegisterFamiliar { key_id, label } => {
+                if key.role != KeyRole::Owner {
+                    bail!("only owner keys can register Familiars");
+                }
+                match self.keys_of(&sender).get(key_id) {
+                    Some(k) if matches!(k.role, KeyRole::Session { .. }) => {}
+                    Some(_) => bail!("Familiars are agent session keys; that's an owner key"),
+                    None => bail!("that key isn't on this account (add it as a session key first)"),
+                }
+                self.familiars_mut(j, &sender).insert(key_id.clone(), label.clone());
+            }
         }
         Ok(())
     }
@@ -724,6 +997,7 @@ impl State {
             Action::Transfer { amount, .. } => *amount,
             Action::RegisterName { name } => normalize_name(name).map(|n| name_price(&n)).unwrap_or(0),
             Action::RegisterValidator { bond, .. } => *bond,
+            Action::CreateHunt { amount, .. } | Action::FundHunt { amount, .. } => *amount,
             _ => 0,
         })
     }
@@ -752,6 +1026,24 @@ impl State {
                 h.update(&e.to_le_bytes());
                 h.update(set.join(",").as_bytes());
             }
+        }
+        // Hunts and GitHub/Familiar records (empty on chains that predate them, so old roots hold).
+        if !self.hunts.is_empty() || self.next_hunt_id != 0 {
+            h.update(b"hunts");
+            h.update(&self.next_hunt_id.to_le_bytes());
+            for hunt in self.hunts.values() {
+                h.update(serde_json::to_string(hunt).unwrap().as_bytes());
+            }
+        }
+        if !self.github.is_empty() {
+            h.update(b"github");
+            for l in self.github.values() {
+                h.update(serde_json::to_string(l).unwrap().as_bytes());
+            }
+        }
+        if !self.familiars.is_empty() {
+            h.update(b"familiars");
+            h.update(serde_json::to_string(&self.familiars).unwrap().as_bytes());
         }
         h.finalize().to_hex().to_string()
     }
@@ -798,6 +1090,26 @@ impl State {
                 let amount = self.validators.get(validator).map(|_| String::new()).unwrap_or_default();
                 format!("{from} reclaimed the bond of validator {}{amount}", who(validator))
             }
+            Action::LinkGithub { handle, .. } => format!("{from} linked GitHub @{handle}"),
+            Action::UnlinkGithub { handle } => format!("{from} unlinked GitHub @{handle}"),
+            Action::CreateHunt { repo, issue, amount, title, .. } => format!("{from} put {} on {repo}#{issue}: “{title}”", fmt_fang(*amount)),
+            Action::FundHunt { hunt_id, amount } => {
+                let what = self.hunts.get(hunt_id).map(|h| format!("{}#{}", h.repo, h.issue)).unwrap_or_else(|| format!("hunt #{hunt_id}"));
+                format!("{from} added {} to the bounty on {what}", fmt_fang(*amount))
+            }
+            Action::AwardHunt { hunt_id, to, pr, familiar_key } => {
+                let h = self.hunts.get(hunt_id);
+                let what = h.map(|h| format!("{}#{}", h.repo, h.issue)).unwrap_or_else(|| format!("hunt #{hunt_id}"));
+                let to_name = if crypto::is_address(to) { who(to) } else { format!("{}{NAME_SUFFIX}", normalize_name(to).unwrap_or(to.clone())) };
+                let paid = h.map(|h| format!(" {}", fmt_fang(h.amount))).unwrap_or_default();
+                let fam = familiar_key.as_ref().and_then(|k| self.resolve(to).ok().and_then(|a| self.familiars.get(&a)?.get(k).cloned())).map(|l| format!(" (earned by their Familiar “{l}”)")).unwrap_or_default();
+                format!("{from} awarded the{paid} bounty on {what} to {to_name} for PR #{pr}{fam}")
+            }
+            Action::CancelHunt { hunt_id } => {
+                let what = self.hunts.get(hunt_id).map(|h| format!("{}#{}", h.repo, h.issue)).unwrap_or_else(|| format!("hunt #{hunt_id}"));
+                format!("{from} cancelled the hunt on {what}; funders were refunded")
+            }
+            Action::RegisterFamiliar { label, .. } => format!("{from} registered the Familiar “{label}”"),
         }
     }
 }
@@ -836,6 +1148,8 @@ impl SummonOpts {
 
 /// Blocks kept in memory; older ones are read from `blocks.jsonl` on demand.
 pub const RECENT_BLOCKS: usize = 2_048;
+/// How far behind the (claimed) network height still counts as synced.
+pub const SYNC_SLACK: u64 = 3;
 /// During replay, verify the state root every this many blocks (plus the last one).
 pub const REPLAY_ROOT_CHECK: u64 = 1_000;
 /// Certificates are stored on disk for these heights (plus every epoch's last block) …
@@ -944,6 +1258,24 @@ pub struct Chain {
     pub gossip: Option<futures::channel::mpsc::UnboundedSender<Tx>>,
     log: File,
     log_len: u64,
+    /// Validator-set history + handoff proofs (`epochs.json`).
+    pub epochs: crate::epochs::EpochRegistry,
+    /// Set when this node fast-synced: history starts after this height.
+    pub base: Option<Base>,
+    /// Latest tip each HTTP peer *claims* (display-only; never trusted for anything else).
+    claims: HashMap<String, u64>,
+}
+
+/// The certified snapshot a fast-synced node started from (`base.json` + `base.state.zst`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Base {
+    pub height: u64,
+    pub hash: String,
+    pub state_root: String,
+    /// Hash of the block before the current epoch's first block, when that's before `height`
+    /// (consensus anchors each epoch's engine there). From the peer, not certified.
+    #[serde(default)]
+    pub epoch_start: Option<(u64, String)>,
 }
 
 /// A finalized block handed to `Chain::execute`, straight from consensus.
@@ -1043,13 +1375,27 @@ impl Chain {
             None
         };
         let role = if keys.is_some() { Role::Validator } else { Role::FullNode };
-        let state = genesis.initial_state();
-        let genesis_root = state.root();
+        let base: Option<Base> = match fs::read(home.join("base.json")) {
+            Ok(b) => Some(serde_json::from_slice(&b)?),
+            Err(_) => None,
+        };
+        let state = match &base {
+            Some(b) => {
+                let st = crate::snapshot::decode_state(&genesis, &fs::read(home.join("base.state.zst")).context("base.state.zst missing")?)?;
+                if st.root() != b.state_root {
+                    bail!("base.state.zst doesn't match base.json's state root");
+                }
+                st
+            }
+            None => genesis.initial_state(),
+        };
+        let genesis_root = genesis.initial_state().root();
         let genesis_hash = hex::encode(crate::consensus::genesis_block(&genesis).digest_bytes());
         let path = home.join("blocks.jsonl");
         let log = OpenOptions::new().create(true).append(true).open(&path)?;
         let (cblocks, cidx) = RecordFile::open(&home.join("cblocks.bin"))?;
         let (certs, certidx) = RecordFile::open(&home.join("certs.bin"))?;
+        let genesis_for_epochs = genesis.clone();
         let mut chain = Chain {
             home: home.into(),
             genesis,
@@ -1079,7 +1425,19 @@ impl Chain {
             gossip: None,
             log,
             log_len: 0,
+            epochs: crate::epochs::EpochRegistry::genesis(&genesis_for_epochs),
+            base: base.clone(),
+            claims: HashMap::new(),
         };
+        if let Some(b) = &base {
+            chain.height = b.height;
+            chain.last_hash = b.hash.clone();
+        }
+        let saved_epochs: Option<crate::epochs::EpochRegistry> = fs::read(home.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        if base.is_some() {
+            // Fast-synced: the set history came verified with the snapshot.
+            chain.epochs = saved_epochs.clone().ok_or_else(|| anyhow!("epochs.json missing for a fast-synced home"))?;
+        }
         let mut offset = 0u64;
         let mut reader = BufReader::new(File::open(&path)?);
         let mut line = String::new();
@@ -1104,10 +1462,15 @@ impl Chain {
             }
         }
         // Consensus block bytes: keep exactly one per executed height.
+        let first = chain.base_height() + 1;
         for (h, at, len) in cidx {
-            if h == chain.cblock_index.len() as u64 + 1 && h <= chain.height {
+            if h == first + chain.cblock_index.len() as u64 && h <= chain.height {
                 chain.cblock_index.push((at, len));
             }
+        }
+        if let Some(saved) = saved_epochs {
+            let chain_id = chain.genesis.chain_id.clone();
+            chain.epochs.merge_sigs(&chain_id, &saved);
         }
         chain.finalized_tip = chain.height();
         Ok(chain)
@@ -1120,6 +1483,30 @@ impl Chain {
 
     pub fn height(&self) -> u64 {
         self.height
+    }
+
+    /// Records a peer's claimed tip (display only).
+    pub fn note_claim(&mut self, peer: &str, tip: u64) {
+        self.claims.insert(peer.to_string(), tip);
+    }
+
+    /// The network height peers claim: the median of their latest claims, so one lying peer
+    /// can't move it. Display-only (status/health); verified heights come from certificates.
+    pub fn network_height_claimed(&self) -> u64 {
+        let mut v: Vec<u64> = self.claims.values().copied().collect();
+        v.sort_unstable();
+        let median = if v.is_empty() { 0 } else { v[(v.len() - 1) / 2] };
+        median.max(self.finalized_tip).max(self.height)
+    }
+
+    /// Behind the network by more than a few blocks (verified or claimed).
+    pub fn syncing(&self) -> bool {
+        self.height + SYNC_SLACK < self.network_height_claimed()
+    }
+
+    /// Height of the snapshot this node fast-synced from (0 = full history).
+    pub fn base_height(&self) -> u64 {
+        self.base.as_ref().map(|b| b.height).unwrap_or(0)
     }
 
     pub fn last_hash(&self) -> &str {
@@ -1139,7 +1526,10 @@ impl Chain {
         if height >= first_recent {
             return self.recent.get((height - first_recent) as usize).cloned();
         }
-        let at = *self.block_offsets.get(height as usize - 1)?;
+        if height <= self.base_height() {
+            return None;
+        }
+        let at = *self.block_offsets.get((height - self.base_height()) as usize - 1)?;
         use std::io::{Seek, SeekFrom};
         let mut f = File::open(self.home.join("blocks.jsonl")).ok()?;
         f.seek(SeekFrom::Start(at)).ok()?;
@@ -1157,7 +1547,7 @@ impl Chain {
     /// Newest-first blocks below `before`.
     pub fn blocks_before(&self, before: u64, limit: usize) -> Vec<Block> {
         let top = before.saturating_sub(1).min(self.height);
-        (1..=top).rev().take(limit).filter_map(|h| self.block(h)).collect()
+        (self.base_height() + 1..=top).rev().take(limit).filter_map(|h| self.block(h)).collect()
     }
 
     /// State root after executing `height` (0 = genesis).
@@ -1165,12 +1555,34 @@ impl Chain {
         if height == 0 {
             return Some(self.genesis_root.clone());
         }
+        if let Some(b) = self.base.as_ref().filter(|b| b.height == height) {
+            return Some(b.state_root.clone());
+        }
         self.block(height).map(|b| b.state_root)
+    }
+
+    /// Hash of the executed block at `height`, including the fast-sync base and the anchor of
+    /// the epoch we fast-synced into.
+    pub fn hash_at(&self, height: u64) -> Option<String> {
+        if height == 0 {
+            return Some(self.genesis_hash.clone());
+        }
+        if let Some(b) = &self.base {
+            if b.height == height {
+                return Some(b.hash.clone());
+            }
+            if let Some((h, hash)) = &b.epoch_start {
+                if *h == height {
+                    return Some(hash.clone());
+                }
+            }
+        }
+        self.block(height).map(|b| b.hash)
     }
 
     /// Exact consensus block bytes at `height`.
     pub fn cblock(&self, height: u64) -> Option<Vec<u8>> {
-        let (at, len) = *self.cblock_index.get(height.checked_sub(1)? as usize)?;
+        let (at, len) = *self.cblock_index.get(height.checked_sub(self.base_height() + 1)? as usize)?;
         self.cblocks.read(at, len)
     }
 
@@ -1222,6 +1634,7 @@ impl Chain {
     }
 
     fn push_block(&mut self, block: Block, offset: u64) {
+        debug_assert_eq!(self.block_offsets.len() as u64 + self.base_height() + 1, block.height);
         self.block_offsets.push(offset);
         if let Ok(key) = u64::from_str_radix(&block.hash[..16.min(block.hash.len())], 16) {
             self.block_by_hash.insert(key, block.height);
@@ -1250,6 +1663,7 @@ impl Chain {
         }
         if self.state.params.is_boundary(block.height) {
             self.state.end_epoch(self.state.params.epoch_of(block.height));
+            self.record_epoch(block.height);
         }
         // The root is O(state) to compute, so replay checks it periodically (and at the end).
         if block.height % REPLAY_ROOT_CHECK == 0 && self.state.root() != block.state_root {
@@ -1301,6 +1715,9 @@ impl Chain {
         }
         if self.state.params.is_boundary(f.height) {
             self.state.end_epoch(self.state.params.epoch_of(f.height));
+            if self.record_epoch(f.height) {
+                self.sign_handoffs();
+            }
         }
         let block = Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, proposer: f.proposer, state_root: self.state.root(), txs, hash: f.hash, signature: String::new(), failed };
         let (at, len) = self.cblocks.append(f.height, &f.cblock)?;
@@ -1317,7 +1734,85 @@ impl Chain {
             self.store_cert(f.height, cert)?;
         }
         self.finalized_tip = self.finalized_tip.max(f.height);
+        if crate::snapshot::is_checkpoint(f.height) {
+            self.take_snapshot();
+        }
         self.revalidate_mempool();
+        Ok(())
+    }
+
+    /// After executing an epoch's last block: remember the next epoch's set. Returns whether it
+    /// changed (then the outgoing validators sign a handoff).
+    fn record_epoch(&mut self, boundary: u64) -> bool {
+        let next = self.state.params.epoch_of(boundary) + 1;
+        let keys: Vec<String> = self.state.active_set(next).map(|s| s.iter().map(|v| v.consensus_key.clone()).collect()).unwrap_or_default();
+        let changed = self.epochs.record(next, keys);
+        if changed {
+            self.save_epochs();
+        }
+        changed
+    }
+
+    /// Signs handoffs for set changes this validator presided over (also retroactively).
+    pub fn sign_handoffs(&mut self) -> usize {
+        let Some(seed) = self.keys.as_ref().map(|k| k.seed()) else { return 0 };
+        let chain_id = self.genesis.chain_id.clone();
+        let n = self.epochs.sign_missing(&chain_id, seed).len();
+        if n > 0 {
+            self.save_epochs();
+        }
+        n
+    }
+
+    pub fn merge_epochs(&mut self, other: &crate::epochs::EpochRegistry) -> usize {
+        let chain_id = self.genesis.chain_id.clone();
+        let n = self.epochs.merge_sigs(&chain_id, other);
+        if n > 0 {
+            self.save_epochs();
+        }
+        n
+    }
+
+    fn save_epochs(&self) {
+        if let Ok(json) = serde_json::to_vec(&self.epochs) {
+            let tmp = self.home.join("epochs.json.tmp");
+            if fs::write(&tmp, json).is_ok() {
+                let _ = fs::rename(tmp, self.home.join("epochs.json"));
+            }
+        }
+    }
+
+    /// Writes a snapshot of the current state in the background.
+    fn take_snapshot(&self) {
+        let (home, height, root, state) = (self.home.clone(), self.height, self.state.root(), self.state.clone());
+        std::thread::spawn(move || {
+            if let Err(e) = crate::snapshot::write(&home, height, &root, &state) {
+                tracing::warn!(height, error = %e, "snapshot failed");
+            }
+        });
+    }
+
+    /// Installs a verified snapshot into an empty home, then executes the manifest's blocks.
+    pub fn install_snapshot(&mut self, v: &crate::snapshot::Verified, state: State, packed: &[u8], epoch_start: Option<(u64, String)>) -> Result<()> {
+        if self.height != 0 || self.base.is_some() {
+            bail!("fast sync needs an empty home");
+        }
+        let base_hash = hex::encode(v.blocks[0].parent_bytes());
+        fs::write(self.home.join("base.state.zst"), packed)?;
+        let base = Base { height: v.height, hash: base_hash.clone(), state_root: v.state_root.clone(), epoch_start };
+        self.epochs = v.epochs.clone();
+        self.save_epochs();
+        fs::write(self.home.join("base.json"), serde_json::to_vec_pretty(&base)?)?;
+        self.state = state;
+        self.height = v.height;
+        self.last_hash = base_hash;
+        self.base = Some(base);
+        self.finalized_tip = v.height;
+        let last = v.blocks.len() - 1;
+        for (i, b) in v.blocks.iter().enumerate() {
+            let cert = (i == last).then(|| v.finalization.clone());
+            self.execute(crate::consensus::finalized_from(b, cert))?;
+        }
         Ok(())
     }
 
@@ -1777,6 +2272,21 @@ mod audit {
     }
 
     #[test]
+    fn claimed_network_height_is_display_only_and_robust_to_one_liar() {
+        let (_h, mut c) = fresh("claims");
+        assert!(!c.syncing());
+        c.note_claim("a", 1_000);
+        assert!(c.syncing(), "behind an honest peer's claim");
+        assert_eq!(c.finalized_tip, 0, "claims never move the verified tip");
+        // One liar among three can't move the median.
+        c.note_claim("a", 2);
+        c.note_claim("b", 1);
+        c.note_claim("liar", u64::MAX);
+        assert_eq!(c.network_height_claimed(), 2);
+        assert!(!c.syncing());
+    }
+
+    #[test]
     fn faucet_has_a_global_budget() {
         let (_h, mut c) = fresh("budget");
         for i in 0..FAUCET_MAX_PENDING as u8 {
@@ -1840,5 +2350,160 @@ mod audit {
         println!("512-tx block over 200k accounts executed in {took:?}");
         assert_eq!(c.block(c.height()).unwrap().txs.len(), 512);
         assert!(took.as_secs_f64() < if cfg!(debug_assertions) { 10.0 } else { 1.0 }, "{took:?}");
+    }
+}
+
+#[cfg(test)]
+mod hunts {
+    use super::*;
+
+    struct T {
+        home: PathBuf,
+        c: Chain,
+        admin: Keys,
+    }
+
+    fn setup(tag: &str) -> T {
+        let home = std::env::temp_dir().join(format!("blockula-hunts-{tag}-{}-{}", now_ms(), std::process::id()));
+        Chain::summon(&home, &SummonOpts::new("hunts", 1)).unwrap();
+        let seed: [u8; 32] = hex::decode(fs::read_to_string(home.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
+        let mut c = Chain::open(&home).unwrap();
+        for i in 1..=4u8 {
+            c.faucet(&Keys::from_seed([i; 32]).address(), 100 * DROPS_PER_FANG).unwrap();
+        }
+        c.produce_block().unwrap();
+        T { home, c, admin: Keys::from_seed(seed) }
+    }
+
+    impl T {
+        fn tx(&mut self, who: &Keys, action: Action) -> Result<String> {
+            let from = who.address();
+            let mut tx = Tx { chain_id: "hunts".into(), nonce: self.c.next_nonce(&from), from, fee: 0, action, memo: String::new(), public_key: hex::encode(who.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+            tx.fee = min_fee(tx.size());
+            let id = self.c.submit(tx.sign(who))?;
+            self.c.produce_block()?;
+            match self.c.failure(&id) {
+                Some((r, _)) => bail!(r.clone()),
+                None => Ok(id),
+            }
+        }
+        fn bal(&self, k: &Keys) -> u64 {
+            self.c.state.account(&k.address()).balance
+        }
+        fn blocks(&mut self, n: u64) {
+            for _ in 0..n {
+                self.c.produce_block_with(vec![]).unwrap();
+            }
+        }
+    }
+
+    fn create(repo: &str, issue: u64, amount: u64, expires_at: u64, title: &str) -> Action {
+        Action::CreateHunt { repo: repo.into(), issue, amount, expires_at, title: title.into() }
+    }
+
+    #[test]
+    fn create_fund_award_and_double_award() {
+        let mut t = setup("award");
+        let (alice, bob, carol) = (Keys::from_seed([1; 32]), Keys::from_seed([2; 32]), Keys::from_seed([3; 32]));
+        let h = t.c.height();
+        // Validation: the seeded issues' repo/numbers work; bad inputs don't.
+        assert!(t.tx(&alice, create("jackdishman/blockula", 1, 5 * DROPS_PER_FANG, h + 100, "too small")).unwrap_err().to_string().contains("at least"));
+        assert!(t.tx(&alice, create("jackdishman/blockula", 1, 10 * DROPS_PER_FANG, h, "past")).is_err());
+        assert!(t.tx(&alice, create("jackdishman/blockula", 1, 10 * DROPS_PER_FANG, h + 40_000_000, "forever")).unwrap_err().to_string().contains("about a year"));
+        assert!(t.tx(&alice, create("not a repo", 1, 10 * DROPS_PER_FANG, h + 100, "x")).is_err());
+        assert!(t.tx(&alice, create("jackdishman/blockula", 0, 10 * DROPS_PER_FANG, h + 100, "x")).is_err());
+        assert!(t.tx(&alice, create("jackdishman/blockula", 1, 10 * DROPS_PER_FANG, h + 100, &"t".repeat(97))).is_err());
+        let before = t.bal(&alice);
+        t.tx(&alice, create("jackdishman/blockula", 1, 50 * DROPS_PER_FANG, h + 100, "Shared tx test vectors")).unwrap();
+        assert!(t.bal(&alice) < before - 50 * DROPS_PER_FANG + 1, "escrow debited");
+        let id = *t.c.state.hunts.keys().next().unwrap();
+        t.tx(&bob, Action::FundHunt { hunt_id: id, amount: 5 * DROPS_PER_FANG }).unwrap();
+        t.tx(&bob, Action::FundHunt { hunt_id: id, amount: 2 * DROPS_PER_FANG }).unwrap();
+        assert_eq!(t.c.state.hunts[&id].amount, 57 * DROPS_PER_FANG);
+        assert_eq!(t.c.state.hunts[&id].contribution(&bob.address()), 7 * DROPS_PER_FANG);
+        assert!(t.tx(&bob, Action::FundHunt { hunt_id: id, amount: 1 }).is_err(), "min funding");
+        // Only the creator or an admin awards.
+        assert!(t.tx(&bob, Action::AwardHunt { hunt_id: id, to: bob.address(), pr: 9, familiar_key: None }).unwrap_err().to_string().contains("creator or a validator admin"));
+        let c0 = t.bal(&carol);
+        t.tx(&alice, Action::AwardHunt { hunt_id: id, to: carol.address(), pr: 9, familiar_key: None }).unwrap();
+        assert_eq!(t.bal(&carol), c0 + 57 * DROPS_PER_FANG);
+        assert!(!t.c.state.hunts[&id].self_awarded());
+        assert!(t.tx(&alice, Action::AwardHunt { hunt_id: id, to: bob.address(), pr: 9, familiar_key: None }).unwrap_err().to_string().contains("already"));
+        assert!(t.tx(&t.admin.clone_keys(), Action::CancelHunt { hunt_id: id }).is_err(), "awarded hunts can't be cancelled");
+        assert!(t.tx(&bob, Action::FundHunt { hunt_id: id, amount: DROPS_PER_FANG }).is_err());
+        // Self-award is allowed (and flagged).
+        t.tx(&bob, create("jackdishman/blockula", 4, 10 * DROPS_PER_FANG, t.c.height() + 50, "QR")).unwrap();
+        let id2 = t.c.state.hunts.keys().last().copied().unwrap();
+        t.tx(&bob, Action::AwardHunt { hunt_id: id2, to: bob.address(), pr: 3, familiar_key: None }).unwrap();
+        assert!(t.c.state.hunts[&id2].self_awarded());
+        // Everything replays to the same root.
+        let root = t.c.state.root();
+        drop(t.c);
+        assert_eq!(Chain::open(&t.home).unwrap().state.root(), root);
+        fs::remove_dir_all(&t.home).ok();
+    }
+
+    #[test]
+    fn cancel_refunds_funders_pro_rata() {
+        let mut t = setup("cancel");
+        let (alice, bob, carol) = (Keys::from_seed([1; 32]), Keys::from_seed([2; 32]), Keys::from_seed([3; 32]));
+        let exp = t.c.height() + 5;
+        t.tx(&alice, create("jackdishman/blockula", 2, 20 * DROPS_PER_FANG, exp, "fuzz targets")).unwrap();
+        let id = *t.c.state.hunts.keys().next().unwrap();
+        t.tx(&bob, Action::FundHunt { hunt_id: id, amount: 3 * DROPS_PER_FANG }).unwrap();
+        t.tx(&carol, Action::FundHunt { hunt_id: id, amount: 4 * DROPS_PER_FANG }).unwrap();
+        // Creator can't cancel before expiry; strangers never.
+        assert!(t.tx(&alice, Action::CancelHunt { hunt_id: id }).unwrap_err().to_string().contains("after block"));
+        assert!(t.tx(&bob, Action::CancelHunt { hunt_id: id }).is_err());
+        t.blocks(5);
+        assert!(t.tx(&bob, Action::FundHunt { hunt_id: id, amount: DROPS_PER_FANG }).unwrap_err().to_string().contains("expired"));
+        let (a0, b0, c0) = (t.bal(&alice), t.bal(&bob), t.bal(&carol));
+        t.tx(&alice, Action::CancelHunt { hunt_id: id }).unwrap();
+        let fee_paid = a0 + 20 * DROPS_PER_FANG - t.bal(&alice);
+        assert!(fee_paid < DROPS_PER_FANG / 1000, "alice got her 20 back (minus the cancel fee)");
+        assert_eq!(t.bal(&bob), b0 + 3 * DROPS_PER_FANG);
+        assert_eq!(t.bal(&carol), c0 + 4 * DROPS_PER_FANG);
+        assert_eq!(t.c.state.hunts[&id].status, HuntStatus::Cancelled);
+        assert!(t.tx(&alice, Action::AwardHunt { hunt_id: id, to: bob.address(), pr: 1, familiar_key: None }).is_err());
+        // Admins can cancel open hunts any time.
+        t.tx(&alice, create("jackdishman/blockula", 3, 10 * DROPS_PER_FANG, t.c.height() + 1000, "python sdk")).unwrap();
+        let id2 = t.c.state.hunts.keys().last().copied().unwrap();
+        let admin = t.admin.clone_keys();
+        t.tx(&admin, Action::CancelHunt { hunt_id: id2 }).unwrap();
+        fs::remove_dir_all(&t.home).ok();
+    }
+
+    #[test]
+    fn github_links_and_familiars() {
+        let mut t = setup("gh");
+        let (alice, bob) = (Keys::from_seed([1; 32]), Keys::from_seed([2; 32]));
+        assert!(t.tx(&alice, Action::LinkGithub { handle: "-bad".into(), gist_id: "abc".into() }).is_err());
+        assert!(t.tx(&alice, Action::LinkGithub { handle: "vlad".into(), gist_id: "ABC".into() }).is_err(), "gist id is lowercase");
+        t.tx(&alice, Action::LinkGithub { handle: "Vlad".into(), gist_id: "abc123".into() }).unwrap();
+        assert!(t.tx(&alice, Action::LinkGithub { handle: "other".into(), gist_id: "abc".into() }).unwrap_err().to_string().contains("unlink it first"));
+        assert!(t.tx(&bob, Action::LinkGithub { handle: "vlad".into(), gist_id: "def".into() }).unwrap_err().to_string().contains("already linked"));
+        assert!(t.tx(&bob, Action::UnlinkGithub { handle: "vlad".into() }).is_err(), "only the holder or an admin");
+        let admin = t.admin.clone_keys();
+        t.tx(&admin, Action::UnlinkGithub { handle: "VLAD".into() }).unwrap();
+        t.tx(&bob, Action::LinkGithub { handle: "vlad".into(), gist_id: "def".into() }).unwrap();
+        assert_eq!(t.c.state.github["vlad"].account, bob.address());
+        assert!(!t.c.state.github_by_account.contains_key(&alice.address()));
+        // Familiars must be session keys on the account.
+        let agent = Keys::from_seed([42; 32]);
+        let kid = key_id(&agent.public_key());
+        assert!(t.tx(&alice, Action::RegisterFamiliar { key_id: kid.clone(), label: "claude".into() }).unwrap_err().to_string().contains("isn't on this account"));
+        let h = t.c.height();
+        t.tx(&alice, Action::AddKey { key_id: kid.clone(), label: "claude".into(), role: KeyRole::Session { limit: DROPS_PER_FANG, period_blocks: 10, expires_at: h + 100 } }).unwrap();
+        t.tx(&alice, Action::RegisterFamiliar { key_id: kid.clone(), label: "claude".into() }).unwrap();
+        // Awards can credit the Familiar; a non-Familiar key can't be named.
+        t.tx(&bob, create("jackdishman/blockula", 5, 10 * DROPS_PER_FANG, t.c.height() + 100, "PQ handshake")).unwrap();
+        let id = t.c.state.hunts.keys().last().copied().unwrap();
+        assert!(t.tx(&bob, Action::AwardHunt { hunt_id: id, to: alice.address(), pr: 8, familiar_key: Some("ab".repeat(32)) }).unwrap_err().to_string().contains("Familiar"));
+        t.tx(&bob, Action::AwardHunt { hunt_id: id, to: alice.address(), pr: 8, familiar_key: Some(kid.clone()) }).unwrap();
+        assert_eq!(t.c.state.hunts[&id].familiar_key.as_deref(), Some(kid.as_str()));
+        // Removing the key drops the Familiar.
+        t.tx(&alice, Action::RemoveKey { key_id: kid.clone() }).unwrap();
+        assert!(!t.c.state.familiars.contains_key(&alice.address()));
+        fs::remove_dir_all(&t.home).ok();
     }
 }

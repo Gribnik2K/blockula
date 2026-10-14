@@ -20,7 +20,17 @@ export type Action =
   | { type: "approve_validator"; validator: string }
   | { type: "remove_validator"; validator: string }
   /** Reclaim the bond of a removed validator you own, one epoch after it left. */
-  | { type: "unbond"; validator: string };
+  | { type: "unbond"; validator: string }
+  /** Claim a GitHub handle; a public gist by that handle containing your boo1 address verifies it. */
+  | { type: "link_github"; handle: string; gist_id: string }
+  | { type: "unlink_github"; handle: string }
+  /** Escrow a bounty on a GitHub issue ("owner/name", issue number). */
+  | { type: "create_hunt"; repo: string; issue: number; amount: string; expires_at: number; title: string }
+  | { type: "fund_hunt"; hunt_id: number; amount: string }
+  | { type: "award_hunt"; hunt_id: number; to: string; pr: number; familiar_key?: string }
+  | { type: "cancel_hunt"; hunt_id: number }
+  /** Mark one of your session keys as an agent Familiar. */
+  | { type: "register_familiar"; key_id: string; label: string };
 
 export interface UnsignedTx {
   chain_id: string;
@@ -87,6 +97,27 @@ export function signingBytes(tx: UnsignedTx): Uint8Array {
       break;
     case "unbond":
       w.u8(7); w.str(a.validator);
+      break;
+    case "link_github":
+      w.u8(8); w.str(a.handle); w.str(a.gist_id);
+      break;
+    case "unlink_github":
+      w.u8(9); w.str(a.handle);
+      break;
+    case "create_hunt":
+      w.u8(10); w.str(a.repo); w.u64(BigInt(a.issue)); w.u64(BigInt(a.amount)); w.u64(BigInt(a.expires_at)); w.str(a.title);
+      break;
+    case "fund_hunt":
+      w.u8(11); w.u64(BigInt(a.hunt_id)); w.u64(BigInt(a.amount));
+      break;
+    case "award_hunt":
+      w.u8(12); w.u64(BigInt(a.hunt_id)); w.str(a.to); w.u64(BigInt(a.pr)); w.str(a.familiar_key ?? "");
+      break;
+    case "cancel_hunt":
+      w.u8(13); w.u64(BigInt(a.hunt_id));
+      break;
+    case "register_familiar":
+      w.u8(14); w.str(a.key_id); w.str(a.label);
       break;
   }
   w.str(tx.memo);

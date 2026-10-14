@@ -61,6 +61,11 @@ Native account abstraction (Phase 1). Each account holds a list of authorized ke
 - **Covens:** teams claiming Hunts together, with the payout split recorded on-chain and shared streaks. **Seasons** (Season 1: October) with leaderboards ranked by Soul, not tokens.
 - **Profiles** in the explorer: merged PRs, Soul, who vouched for whom.
 
+### Status (live now: Hunts v0)
+- `create_hunt` escrows a bounty on a GitHub issue (min 10 FANG, ≤ ~1 year). `fund_hunt` lets anyone add to it. `award_hunt` (creator or Season 0 admin) pays it out once and records the PR; self-awards are allowed but flagged. `cancel_hunt` (creator after expiry, admin any time) refunds every funder exactly what they put in.
+- `link_github` is an on-chain claim: one handle per account, one account per handle. The holder or an admin can unlink, so admins can clear squatters. Nodes check it off-chain: a public gist owned by the handle must contain the account's address (`/api/github/{handle}`). Validator-attested GitHub facts, payout-on-merge and square-root pooling come next.
+- `register_familiar` marks a session key as an agent Familiar. Awards can credit it, and profiles show "won by vlad.boo's Familiar 'claude'".
+
 ### 🐈‍⬛ Familiars: agent contributions, encouraged
 Agents are first-class contributors, but every agent is the **Familiar of a human sponsor** who has Soul.
 - **Binding:** a Familiar is a session key on the sponsor's account plus an on-chain `familiar_of` link. Its rewards go to the sponsor (who can set a split), and its mistakes cost the sponsor's Soul.
@@ -119,10 +124,17 @@ What runs today (Commonware `=2026.9.0`: consensus, p2p, broadcast, storage, run
   - Faucet: 1 drip per address per hour and per client per 10 minutes, counted only on success. At most 32 drips pending, otherwise `503 faucet busy`.
   - Mempool: capped at 5,000 txs and 64 per sender, evicting the lowest fee-per-byte tx when full.
   - CORS stays permissive for the web wallet.
-- **`blockula join --genesis <file|validator URL> --home <dir>`:** a non-validator full node. It serves the API + explorer immediately (`/api/status` shows `syncing`, `sync_progress` and `finalized_height`). It pulls finalized blocks from validators over HTTP (`/api/sync`), checks the hash links and an ML-DSA quorum finalization certificate per batch, and executes them. Batches never cross an epoch boundary, so each one is checked against that epoch's set, which the node learned by executing the previous boundary. Txs and faucet requests are forwarded to a validator. This is a full backfill from genesis; snapshot sync is next.
+- **`blockula join --genesis <file|validator URL> --home <dir>`:** a non-validator full node. It serves the API + explorer immediately (`/api/status` shows `syncing`, `sync_progress` and `finalized_height`). It pulls finalized blocks from validators over HTTP (`/api/sync`), checks the hash links and an ML-DSA quorum finalization certificate per batch, and executes them. Batches never cross an epoch boundary, so each one is checked against that epoch's set, which the node learned by executing the previous boundary. Txs and faucet requests are forwarded to a validator.
+- **Fast sync (default for `join` and new validators; `--full` replays from genesis):**
+  - Every 100 blocks is a checkpoint C. Consensus requires the block at C+4 to carry `exec_height = C` and `exec_root = state_root(C)`. Every validator must have executed C and checked the root before voting; it waits up to 3 block times rather than vote unchecked. So any finalization certificate on C+4 or a descendant certifies `state_root(C)`.
+  - Every node writes its last two checkpoints' state (JSON → zstd → 1 MiB chunks, each BLAKE3-hashed) and serves `/api/snapshot/latest` plus the chunks.
+  - The manifest carries blocks C+1..F, F's certificate, and the validator-set history.
+  - The joiner checks the set history from genesis, the certificate, the hash links and the C+4 commitment. It then downloads and hash-checks the chunks (4 in parallel), rebuilds the state, requires its root to equal the certified one, executes C+1..F and follows normally.
+  - History before C isn't stored on that node; the explorer and `/api/block` say so.
+- **Validator-set history:** when a boundary changes the set, members of the outgoing set sign a handoff `(chain, epoch, hash(new set))`, retroactively too. Nodes swap signatures over `/api/epochs` every 30 s. A joiner needs a 2f+1 handoff for every change. Unchanged epochs need no proof: hiding a change only makes verification fail.
 
 Next:
-1. Snapshot sync: download state at a finalized height and verify it against a certified state root (later, a STARK proof of the chain's history), then backfill history in the background.
+1. Backfill history behind a fast-synced node in the background, and later a STARK proof of the chain's history.
 2. Full nodes on p2p. Discovery only admits peers in the tracked set, so permissionless joining needs a secondary-peer admission policy.
 3. A light-client mode that keeps no full state at all.
 - Validators: about 100, ML-DSA signatures. There is no BLS-style aggregation (a 67-of-100 certificate is ~222 KB), so keep the set small and add STARK signature aggregation later.
@@ -132,13 +144,17 @@ Next:
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Dev node, ML-DSA accounts, transfers, `.boo` names, fee burn, built-in explorer + tutorial, TS SDK, passkey helpers, MCP server, `summon`/`run` | ✅ built |
-| 1 | Multi-validator BFT (Commonware) ✅, p2p ✅, `join` ✅ (snapshot sync next), epochs + on-chain validator onboarding (Season 0 allowlist) ✅, public networking + HTTP hardening ✅, account abstraction + session keys ✅, passkey web wallet ✅ (blockula-wallet.vercel.app), public testnet on Fly.io ✅ (blockula-testnet.fly.dev), npm `@blockula/sdk` + `@blockula/mcp` ✅, internal security/product review + fixes ✅, CLI wallet ✅, health/metrics ✅. Remaining: snapshot sync, a standalone indexer, prebuilt node binaries | mostly done |
-| 1.5 | GitHub linking, validator checks of GitHub facts, Hunts with acceptance tests, Familiars + MCP contribution tools | |
+| 1 | Multi-validator BFT (Commonware) ✅, p2p ✅, `join` ✅ (snapshot sync next), epochs + on-chain validator onboarding (Season 0 allowlist) ✅, public networking + HTTP hardening ✅, account abstraction + session keys ✅, passkey web wallet ✅ (blockula-wallet.vercel.app), public testnet on Fly.io ✅ (blockula-testnet.fly.dev), npm `@blockula/sdk` + `@blockula/mcp` ✅, internal security/product review + fixes ✅, CLI wallet ✅, health/metrics ✅. certified snapshots + fast sync ✅. Remaining: a standalone indexer | mostly done |
+| 1.5 | GitHub linking ✅ (on-chain claim + node-side gist check), Hunts v0 ✅ (escrow, crowdfunding, award/cancel/refund on-chain), Familiars ✅ (registered agent session keys credited on awards), validator-attested GitHub facts, acceptance-test Hunts, MCP contribution tools | in progress |
 | 2 | Séances, Souls, vouching, vesting/clawback, contribution pool, Ghost Mode + viewing keys, The Crypt, proof aggregation | |
 | 3 | Permissionless staking/slashing (replaces the Season 0 allowlist), tokenomics live, governance (conviction voting, repo budgets, fork royalties), audits, mainnet | |
 | 4 | WASM/RISC-V contracts, light clients, STARK signature aggregation | |
 
 ## Known limits
+
+- Fast sync trusts the genesis validator set plus 2f+1 handoffs for every set change. Like any BFT chain without checkpoints in the client, this is weak subjectivity: keys of a long-removed set could forge an alternate history for a fresh joiner. Pin `--genesis-hash` and prefer known peers.
+- The anchor hash for the epoch a node fast-syncs into comes from the peer and isn't certified. It only seeds that epoch's consensus engine on validators.
+- Hunts: awards are trusted to the creator (or an admin), not proven from GitHub yet. GitHub links are claims plus a per-node off-chain gist check (cached 10 min, 30 GitHub calls a minute per node). Squatted handles need an admin to unlink.
 
 - **The p2p transport is not post-quantum.** Commonware's handshake authenticates peers with ML-DSA-65, but the session key comes from X25519 and traffic is encrypted with ChaCha20-Poly1305. Recorded traffic could be decrypted by a future quantum computer. Consensus messages are public anyway; making the key exchange PQ (e.g. hybrid X25519 + ML-KEM-768) needs a patched `commonware-cryptography` handshake.
 - Validator onboarding is a Season 0 allowlist (admin approval), not permissionless staking. The bond isn't slashable yet: simplex reports attributable faults, but nothing acts on them. Voting power is one vote per validator.

@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "blockula"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -314,6 +314,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]

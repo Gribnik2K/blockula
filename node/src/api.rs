@@ -31,6 +31,7 @@ pub struct Node {
     pub client_ip: ClientIpPolicy,
     limits: Arc<Limits>,
     pub stats: Arc<Stats>,
+    github_cache: Arc<Mutex<HashMap<String, (Instant, Value)>>>,
     /// Extra Prometheus text (e.g. Commonware's runtime/p2p metrics on validators).
     pub extra_metrics: Option<Arc<dyn Fn() -> String + Send + Sync>>,
 }
@@ -177,7 +178,7 @@ fn too_many(what: &str, wait: Duration) -> ApiError {
 
 impl Node {
     pub fn new(chain: Shared, marshal: Option<MarshalMailbox>, peers: Vec<String>, client_ip: ClientIpPolicy) -> Self {
-        Self { chain, marshal, peers, client_ip, limits: Default::default(), stats: Default::default(), extra_metrics: None }
+        Self { chain, marshal, peers, client_ip, limits: Default::default(), stats: Default::default(), extra_metrics: None, github_cache: Default::default() }
     }
 
     /// The client's IP for rate limiting, or `None` for local (loopback, un-proxied) callers.
@@ -270,6 +271,12 @@ pub fn router(node: Node) -> Router {
         .route("/api/sync", get(sync))
         .route("/api/validators", get(validators))
         .route("/api/mempool", get(mempool))
+        .route("/api/snapshot/latest", get(snapshot_latest))
+        .route("/api/snapshot/{height}/chunk/{i}", get(snapshot_chunk))
+        .route("/api/epochs", get(epochs))
+        .route("/api/hunts", get(hunts))
+        .route("/api/hunt/{id}", get(hunt))
+        .route("/api/github/{handle}", get(github))
         .route("/api/health", get(health))
         .route("/metrics", get(metrics))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -297,6 +304,13 @@ fn tx_json_with(c: &Chain, tx: &Tx, height: Option<u64>, error: Option<&str>) ->
         Action::ApproveValidator { .. } => ("approve_validator", None, None),
         Action::RemoveValidator { .. } => ("remove_validator", None, None),
         Action::Unbond { .. } => ("unbond", None, None),
+        Action::LinkGithub { .. } => ("link_github", None, None),
+        Action::UnlinkGithub { .. } => ("unlink_github", None, None),
+        Action::CreateHunt { amount, .. } => ("create_hunt", None, Some(*amount)),
+        Action::FundHunt { amount, .. } => ("fund_hunt", None, Some(*amount)),
+        Action::AwardHunt { to, .. } => ("award_hunt", c.state.resolve(to).ok(), None),
+        Action::CancelHunt { .. } => ("cancel_hunt", None, None),
+        Action::RegisterFamiliar { .. } => ("register_familiar", None, None),
     };
     json!({
         "id": tx.id(),
@@ -339,6 +353,11 @@ fn block_json(c: &Chain, b: &Block, full: bool) -> Value {
     v
 }
 
+fn sync_progress(c: &Chain) -> f64 {
+    let t = c.network_height_claimed();
+    if t == 0 { 1.0 } else { (c.height() as f64 / t as f64).min(1.0) }
+}
+
 async fn status(State(n): State<Node>) -> ApiResult {
     let c = n.chain.lock();
     Ok(Json(json!({
@@ -351,8 +370,9 @@ async fn status(State(n): State<Node>) -> ApiResult {
         "validators": c.state.active_sets.get(&c.state.params.epoch_of(c.height() + 1)).map(|s| s.iter().map(|a| label(&c, a)).collect::<Vec<_>>()).unwrap_or_default(),
         "role": c.role,
         "finalized_height": c.finalized_tip.max(c.height()),
-        "syncing": c.height() < c.finalized_tip,
-        "sync_progress": if c.finalized_tip == 0 { 1.0 } else { (c.height() as f64 / c.finalized_tip as f64).min(1.0) },
+        "network_height_claimed": c.network_height_claimed(),
+        "syncing": c.syncing(),
+        "sync_progress": sync_progress(&c),
         "state_root": c.state.root(),
         "consensus": "simplex BFT",
         "epoch": c.state.params.epoch_of(c.height() + 1),
@@ -369,6 +389,8 @@ async fn status(State(n): State<Node>) -> ApiResult {
         "git_sha": GIT_SHA,
         "genesis_hash": c.genesis_hash,
         "head_age_ms": c.last_block().map(|b| crate::chain::now_ms().saturating_sub(b.timestamp_ms)),
+        "history_from": c.base_height() + 1,
+        "fast_synced_from": c.base.as_ref().map(|b| b.height),
         "crypto": { "signatures": "ML-DSA-65 (FIPS 204)", "hash": "BLAKE3-256", "addresses": "bech32m(boo, BLAKE3(pubkey))", "p2p_transport": "X25519 + ChaCha20-Poly1305 (not post-quantum), ML-DSA-65 peer auth" },
     })))
 }
@@ -403,6 +425,11 @@ fn finalized_tx(c: &Chain, h: u64, i: usize) -> Option<(Tx, Option<String>)> {
 
 async fn block(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
     let c = n.chain.lock();
+    if let Ok(h) = id.parse::<u64>() {
+        if h >= 1 && h <= c.base_height() {
+            return Err(ApiError(StatusCode::NOT_FOUND, format!("history before #{} isn't available on this node (it fast-synced from a certified snapshot at #{})", c.base_height() + 1, c.base_height())));
+        }
+    }
     let b = find_block(&c, &id).ok_or_else(|| not_found("block"))?;
     Ok(Json(block_json(&c, &b, true)))
 }
@@ -471,9 +498,9 @@ async fn health(State(n): State<Node>) -> Response {
     let c = n.chain.lock();
     let bt = c.genesis.block_time_ms.max(1);
     let age = c.last_block().map(|b| crate::chain::now_ms().saturating_sub(b.timestamp_ms));
-    let syncing = c.height() < c.finalized_tip;
+    let syncing = c.syncing();
     let reason = match age {
-        _ if syncing => Some(format!("syncing: {} of {}", c.height(), c.finalized_tip)),
+        _ if syncing => Some(format!("syncing: {} of {}", c.height(), c.network_height_claimed())),
         None => Some("no blocks yet".to_string()),
         Some(a) if a > 10 * bt => Some(format!("head is {}s old", a / 1000)),
         _ => None,
@@ -551,6 +578,10 @@ async fn account(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
         "names": names,
         "keys": c.state.keys_of(&addr).into_iter().map(|(id, k)| json!({ "key_id": id, "label": k.label, "role": k.role, "added_at": k.added_at, "spent_this_period": k.spent.to_string(), "window_start": k.window_start })).collect::<Vec<_>>(),
         "recent_txs": recent,
+        "github": c.state.github_by_account.get(&addr).and_then(|h| c.state.github.get(h)).map(|l| json!({ "handle": l.handle, "gist_id": l.gist_id, "linked_at": l.linked_at, "verify_url": format!("/api/github/{}", l.handle) })),
+        "familiars": c.state.familiars.get(&addr).map(|f| f.iter().filter(|(k, _)| c.state.keys_of(&addr).contains_key(*k)).map(|(k, l)| json!({ "key_id": k, "label": l })).collect::<Vec<_>>()).unwrap_or_default(),
+        "hunts_created": c.state.hunts.values().filter(|h| h.creator == addr).map(|h| h.id).collect::<Vec<_>>(),
+        "hunts_won": c.state.hunts.values().filter(|h| h.awarded_to.as_deref() == Some(addr.as_str())).map(|h| json!({ "id": h.id, "repo": h.repo, "issue": h.issue, "amount_display": fmt_fang(h.amount), "pr": h.pr, "self_awarded": h.self_awarded() })).collect::<Vec<_>>(),
     })))
 }
 
@@ -642,6 +673,140 @@ async fn faucet(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
     }
     bump(&n.stats.faucet_drips);
     Ok(Json(v))
+}
+
+/// Manifest of the newest certified state snapshot (for `join --fast`).
+async fn snapshot_latest(State(n): State<Node>) -> ApiResult {
+    let c = n.chain.lock();
+    let m = crate::snapshot::build_manifest(&c).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+    Ok(Json(serde_json::to_value(m).unwrap()))
+}
+
+async fn snapshot_chunk(State(n): State<Node>, Path((height, i)): Path<(u64, usize)>) -> Response {
+    let home = n.chain.lock().home.clone();
+    match crate::snapshot::chunk(&home, height, i) {
+        Some(bytes) => ([(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
+        None => not_found("snapshot chunk").into_response(),
+    }
+}
+
+/// Validator-set history with handoff proofs.
+async fn epochs(State(n): State<Node>) -> ApiResult {
+    let c = n.chain.lock();
+    let mut v = serde_json::to_value(&c.epochs).unwrap();
+    v["proven_through"] = json!(c.epochs.proven_through());
+    Ok(Json(v))
+}
+
+fn hunt_json(c: &Chain, h: &crate::chain::Hunt) -> Value {
+    let expired = h.status == crate::chain::HuntStatus::Open && c.height() > h.expires_at;
+    let familiar = h.familiar_key.as_ref().and_then(|k| h.awarded_to.as_ref().and_then(|a| c.state.familiars.get(a)?.get(k).cloned()));
+    json!({
+        "id": h.id,
+        "repo": h.repo,
+        "issue": h.issue,
+        "issue_url": format!("https://github.com/{}/issues/{}", h.repo, h.issue),
+        "title": h.title,
+        "amount": h.amount.to_string(),
+        "amount_display": fmt_fang(h.amount),
+        "creator": label(c, &h.creator),
+        "funders": h.funders.iter().map(|(a, v)| json!({ "account": label(c, a), "amount": v, "amount_display": fmt_fang(v.parse().unwrap_or(0)) })).collect::<Vec<_>>(),
+        "status": if expired { "expired" } else { match h.status { crate::chain::HuntStatus::Open => "open", crate::chain::HuntStatus::Awarded => "awarded", crate::chain::HuntStatus::Cancelled => "cancelled" } },
+        "created_at": h.created_at,
+        "expires_at": h.expires_at,
+        "awarded_to": h.awarded_to.as_ref().map(|a| label(c, a)),
+        "awarded_by": h.awarded_by.as_ref().map(|a| label(c, a)),
+        "awarded_at": h.awarded_at,
+        "pr": h.pr,
+        "pr_url": h.pr.map(|p| format!("https://github.com/{}/pull/{}", h.repo, p)),
+        "familiar": familiar,
+        "self_awarded": h.self_awarded(),
+        "cancelled_at": h.cancelled_at,
+    })
+}
+
+#[derive(Deserialize)]
+struct HuntQuery {
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Hunts, biggest bounty first. `?status=open|awarded|cancelled|expired`.
+async fn hunts(State(n): State<Node>, Query(q): Query<HuntQuery>) -> ApiResult {
+    let c = n.chain.lock();
+    let mut list: Vec<Value> = c.state.hunts.values().map(|h| hunt_json(&c, h)).filter(|h| q.status.as_deref().is_none_or(|s| h["status"] == s)).collect();
+    list.sort_by_key(|h| std::cmp::Reverse(h["amount"].as_str().and_then(|a| a.parse::<u64>().ok()).unwrap_or(0)));
+    list.truncate(q.limit.unwrap_or(100).min(500));
+    let open_total: u64 = c.state.hunts.values().filter(|h| h.status == crate::chain::HuntStatus::Open && c.height() <= h.expires_at).map(|h| h.amount).sum();
+    Ok(Json(json!({ "count": c.state.hunts.len(), "open_bounties": open_total.to_string(), "open_bounties_display": fmt_fang(open_total), "hunts": list })))
+}
+
+async fn hunt(State(n): State<Node>, Path(id): Path<u64>) -> ApiResult {
+    let c = n.chain.lock();
+    let h = c.state.hunts.get(&id).ok_or_else(|| not_found("hunt"))?;
+    Ok(Json(hunt_json(&c, h)))
+}
+
+/// Upstream GitHub calls allowed per minute (per node), and how long results are cached.
+pub const GITHUB_PER_MINUTE: usize = 30;
+pub const GITHUB_CACHE: Duration = Duration::from_secs(600);
+pub const GITHUB_MAX_BYTES: usize = 1 << 20;
+
+/// Checks a GitHub link off-chain: the gist must be owned by the handle and contain the linked
+/// account's address. Only ever calls api.github.com; results are cached.
+async fn github(State(n): State<Node>, Path(handle): Path<String>) -> ApiResult {
+    check_github_handle(&handle)?;
+    let lower = handle.to_ascii_lowercase();
+    let link = n.chain.lock().state.github.get(&lower).cloned().ok_or_else(|| not_found("GitHub link"))?;
+    let key = format!("{lower}:{}:{}", link.account, link.gist_id);
+    if let Some((at, v)) = n.github_cache.lock().get(&key) {
+        if at.elapsed() < GITHUB_CACHE {
+            return Ok(Json(v.clone()));
+        }
+    }
+    n.limits.allow(&[("github-upstream".into(), GITHUB_PER_MINUTE, Duration::from_secs(60))]).map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "GitHub checks are rate limited; try again in a minute".into()))?;
+    let (verified, reason) = match fetch_gist(&link.gist_id).await {
+        Ok((owner, files)) => {
+            if !owner.eq_ignore_ascii_case(&link.handle) {
+                (false, format!("gist is owned by @{owner}, not @{}", link.handle))
+            } else if !files.iter().any(|f| f.contains(&link.account)) {
+                (false, "gist doesn't contain the account's boo1 address".to_string())
+            } else {
+                (true, "gist owned by the handle contains the account's address".to_string())
+            }
+        }
+        Err(e) => (false, format!("couldn't check the gist: {e}")),
+    };
+    let v = {
+        let c = n.chain.lock();
+        json!({ "handle": link.handle, "account": label(&c, &link.account), "gist_id": link.gist_id, "gist_url": format!("https://gist.github.com/{}", link.gist_id), "linked_at": link.linked_at, "verified": verified, "reason": reason, "attested_by": "this node (off-chain check; validator attestations come later)" })
+    };
+    n.github_cache.lock().insert(key, (Instant::now(), v.clone()));
+    Ok(Json(v))
+}
+
+async fn fetch_gist(gist_id: &str) -> anyhow::Result<(String, Vec<String>)> {
+    // gist_id is validated on-chain as [a-z0-9]{1,64}, so it can't change the host or path.
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).redirect(reqwest::redirect::Policy::none()).user_agent("blockula-node").build()?;
+    let mut req = client.get(format!("https://api.github.com/gists/{gist_id}")).header("accept", "application/vnd.github+json");
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        req = req.bearer_auth(token);
+    }
+    let mut res = req.send().await?;
+    if !res.status().is_success() {
+        anyhow::bail!("GitHub returned {}", res.status());
+    }
+    let mut body = vec![];
+    while let Some(chunk) = res.chunk().await? {
+        body.extend_from_slice(&chunk);
+        if body.len() > GITHUB_MAX_BYTES {
+            anyhow::bail!("gist too large");
+        }
+    }
+    let v: Value = serde_json::from_slice(&body)?;
+    let owner = v["owner"]["login"].as_str().unwrap_or_default().to_string();
+    let files = v["files"].as_object().map(|m| m.values().filter_map(|f| f["content"].as_str().map(String::from)).collect()).unwrap_or_default();
+    Ok((owner, files))
 }
 
 fn validator_json(c: &Chain, v: &crate::chain::ValidatorRecord) -> Value {

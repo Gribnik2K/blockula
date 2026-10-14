@@ -2,6 +2,8 @@ mod api;
 mod chain;
 mod consensus;
 mod crypto;
+mod epochs;
+mod snapshot;
 mod node;
 mod pq;
 mod types;
@@ -43,6 +45,9 @@ struct Net {
     /// Skip the double-signing guards (missing consensus journal, machine.lock mismatch).
     #[arg(long = "i-know-this-key-is-not-running-elsewhere")]
     force_key: bool,
+    /// Replay the whole chain from genesis instead of fast-syncing from a certified snapshot
+    #[arg(long)]
+    full: bool,
 }
 
 #[derive(Subcommand)]
@@ -132,7 +137,7 @@ fn net_opts(net: Net, http_port: Option<u16>, p2p_preset: Option<String>, epheme
         forwarder_secret: std::env::var("BLOCKULA_FORWARDER_SECRET").ok().filter(|s| s.len() >= 32),
         header: net.client_ip_header.map(|h| h.to_lowercase()),
     };
-    NetOpts { bind: net.bind, http_port, p2p_preset, ephemeral_p2p, client_ip, peer_http: net.peer_http, force_key: net.force_key }
+    NetOpts { bind: net.bind, http_port, p2p_preset, ephemeral_p2p, client_ip, peer_http: net.peer_http, force_key: net.force_key, full: net.full }
 }
 
 fn main() -> Result<()> {
@@ -191,7 +196,7 @@ fn main() -> Result<()> {
         }
         Cmd::Wallet { cmd } => validator_cli::wallet(cmd, &blockula_dir()),
         Cmd::Join { genesis, home, port, genesis_hash, net } => {
-            node::join(&genesis, &home, genesis_hash.as_deref())?;
+            node::join(&genesis, &home, genesis_hash.as_deref(), !net.full)?;
             node::run_full_node(home, net_opts(net, Some(port), None, false))
         }
         Cmd::Validator { cmd } => validator_cli::run(cmd),

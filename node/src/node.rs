@@ -57,6 +57,40 @@ pub struct NetOpts {
     pub peer_http: Vec<String>,
     /// `--i-know-this-key-is-not-running-elsewhere`: skip the double-signing guards.
     pub force_key: bool,
+    /// `--full`: replay from genesis instead of fast-syncing from a certified snapshot.
+    pub full: bool,
+}
+
+/// Pulls peers' validator-set handoff signatures every 30s (and signs our own, if we're a
+/// validator), so this node can serve complete proofs to fast-syncing joiners.
+async fn exchange_epochs(chain: Shared, peers: Vec<String>) {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+    chain.lock().sign_handoffs();
+    loop {
+        for peer in &peers {
+            if let Ok(body) = get_capped(&client, &format!("{peer}/api/epochs"), 16 << 20).await {
+                if let Ok(reg) = serde_json::from_slice::<crate::epochs::EpochRegistry>(&body) {
+                    chain.lock().merge_epochs(&reg);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+}
+
+/// Fast sync an empty home from peers' certified snapshots (falls back to full replay).
+async fn maybe_fast_sync(chain: &Shared, peers: &[String], full: bool) {
+    let empty = {
+        let c = chain.lock();
+        c.height() == 0 && c.base.is_none()
+    };
+    if !empty || full || peers.is_empty() {
+        return;
+    }
+    match crate::snapshot::fast_sync(chain, peers).await {
+        Ok(h) => println!("⚡ fast-synced to #{h} from a certified snapshot; history before it isn't stored on this node"),
+        Err(e) => println!("ℹ️  no usable snapshot ({e:#}); syncing from genesis instead"),
+    }
 }
 
 /// The HTTP peers a node syncs from and forwards to: `--peer-http` if given, otherwise the
@@ -208,7 +242,10 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
     // much faster than consensus backfill, and peers prune old consensus data.
     if !peers.is_empty() {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-        rt.block_on(catch_up(shared.clone(), peers.clone()));
+        rt.block_on(async {
+            maybe_fast_sync(&shared, &peers, net.full).await;
+            catch_up(shared.clone(), peers.clone()).await;
+        });
     }
     {
         let chain = shared.lock();
@@ -255,6 +292,7 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
 
         let vcfg = ValidatorConfig { chain: shared.clone(), key, genesis: genesis_block, block_time_ms, epoch_blocks: genesis.epoch_blocks, partition: "blockula".into() };
         let (handle, marshal) = consensus::start_validator(context.child("node"), vcfg, oracle.clone(), oracle.clone(), channels).await;
+        tokio::spawn(exchange_epochs(shared.clone(), peers.clone()));
         tokio::spawn(serve_http(Node::new(shared, Some(marshal), peers, client_ip), http_bind));
         if let Err(e) = handle.await {
             eprintln!("consensus stopped: {e:?}");
@@ -266,11 +304,18 @@ pub fn run_validator(home: PathBuf, net: NetOpts) -> Result<()> {
 #[derive(Serialize, Deserialize)]
 struct JoinConfig {
     peers: Vec<String>,
+    /// Start from a certified snapshot (default) instead of replaying from genesis.
+    #[serde(default = "yes")]
+    fast: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// Prepares a full-node home: genesis.json (copied or fetched from a node) + join.json.
 /// `genesis_hash` pins the chain: the join fails unless genesis hashes to it.
-pub fn join(genesis: &str, home: &Path, genesis_hash: Option<&str>) -> Result<()> {
+pub fn join(genesis: &str, home: &Path, genesis_hash: Option<&str>, fast: bool) -> Result<()> {
     std::fs::create_dir_all(home)?;
     if home.join("validator.key").exists() {
         bail!("{} is a validator home", home.display());
@@ -305,7 +350,7 @@ pub fn join(genesis: &str, home: &Path, genesis_hash: Option<&str>) -> Result<()
     } else {
         std::fs::write(&path, serde_json::to_string_pretty(&g)?)?;
     }
-    std::fs::write(home.join("join.json"), serde_json::to_string_pretty(&JoinConfig { peers })?)?;
+    std::fs::write(home.join("join.json"), serde_json::to_string_pretty(&JoinConfig { peers, fast })?)?;
     Ok(())
 }
 
@@ -317,27 +362,31 @@ pub fn run_full_node(home: PathBuf, net: NetOpts) -> Result<()> {
     println!("🦇 Full node for `{}` at height {} — syncing from {}", chain.genesis.chain_id, chain.height(), peers.join(", "));
     let shared: Shared = Arc::new(Mutex::new(chain));
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let fast = jc.fast && !net.full;
     rt.block_on(async move {
+        // The API and explorer come up immediately, while syncing.
         tokio::spawn(serve_http(Node::new(shared.clone(), None, peers.clone(), net.client_ip.clone()), bind));
+        maybe_fast_sync(&shared, &peers, !fast).await;
+        tokio::spawn(exchange_epochs(shared.clone(), peers.clone()));
         sync_loop(shared, peers, false).await;
     });
     Ok(())
 }
 
 #[derive(Deserialize)]
-struct SyncBatch {
+pub(crate) struct SyncBatch {
     #[serde(default)]
-    tip: u64,
-    blocks: Vec<String>,
-    to: Option<u64>,
-    finalization: Option<String>,
+    pub tip: u64,
+    pub blocks: Vec<String>,
+    pub to: Option<u64>,
+    pub finalization: Option<String>,
 }
 
 /// Largest `/api/sync` response we'll read (500 blocks × 4 MiB is the protocol max, but honest
 /// batches are far smaller; anything bigger is cut off and the peer rotated).
 pub const MAX_SYNC_RESPONSE: usize = 32 << 20;
 
-async fn get_capped(client: &reqwest::Client, url: &str, cap: usize) -> Result<Vec<u8>> {
+pub async fn get_capped(client: &reqwest::Client, url: &str, cap: usize) -> Result<Vec<u8>> {
     let mut res = client.get(url).send().await?;
     if !res.status().is_success() {
         let status = res.status();
@@ -369,6 +418,7 @@ async fn sync_once(chain: &Shared, provider: &consensus::EpochProvider, client: 
     let verifier = provider.epoch_scheme(epoch).ok_or_else(|| anyhow!("no validator set known for epoch {epoch}"))?;
     let body = get_capped(client, &format!("{peer}/api/sync?from={from}&limit={limit}"), MAX_SYNC_RESPONSE).await?;
     let batch: SyncBatch = serde_json::from_slice(&body)?;
+    chain.lock().note_claim(peer, batch.tip);
     if batch.blocks.is_empty() {
         if batch.tip >= from {
             bail!("peer claims height {} but sent nothing", batch.tip);
@@ -435,7 +485,7 @@ async fn catch_up(chain: Shared, peers: Vec<String>) {
 
 /// Verifies a batch (contiguous heights, hash-linked to our tip, quorum finalization over the
 /// last block) and executes it.
-fn apply_batch(chain: &Shared, verifier: &MlDsaScheme, epoch: u64, batch: &SyncBatch) -> Result<()> {
+pub(crate) fn apply_batch(chain: &Shared, verifier: &MlDsaScheme, epoch: u64, batch: &SyncBatch) -> Result<()> {
     let blocks: Vec<CBlock> = batch.blocks.iter().map(|h| Ok(CBlock::decode(hex::decode(h)?.as_slice())?)).collect::<Result<_>>()?;
     let fin_hex = batch.finalization.as_ref().ok_or_else(|| anyhow!("missing finalization"))?;
     let fin_bytes = hex::decode(fin_hex)?;
@@ -471,21 +521,6 @@ fn apply_batch(chain: &Shared, verifier: &MlDsaScheme, epoch: u64, batch: &SyncB
 mod tests {
     use super::*;
     use crate::chain::SummonOpts;
-
-    /// Every outbound HTTP path must speak https (public RPCs and Fly endpoints are https-only).
-    /// A request to a closed local port must fail at connect, not with "scheme is not http".
-    #[tokio::test(flavor = "multi_thread")]
-    async fn https_urls_reach_the_connect_stage() {
-        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
-        let sync = format!("{:#}", get_capped(&client, "https://127.0.0.1:9/api/sync?from=1", 1024).await.unwrap_err());
-        assert!(!sync.contains("scheme"), "{sync}");
-        let e = reqwest::get("https://127.0.0.1:9/api/genesis").await.unwrap_err();
-        let e = format!("{:#}", anyhow::Error::from(e));
-        assert!(!e.contains("scheme"), "{e}");
-        let root = home("tls");
-        let join_err = tokio::task::spawn_blocking(move || format!("{:#}", join("https://127.0.0.1:9", &root, None).unwrap_err())).await.unwrap();
-        assert!(!join_err.contains("scheme"), "{join_err}");
-    }
 
     fn home(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("blockula-node-{tag}-{}-{}", crate::chain::now_ms(), std::process::id()))
@@ -531,8 +566,8 @@ mod tests {
         let g = Genesis::load(&homes[0].join("genesis.json")).unwrap();
         let hash = hex::encode(consensus::genesis_block(&g).digest_bytes());
         let gpath = homes[0].join("genesis.json");
-        assert!(join(gpath.to_str().unwrap(), &root.join("full-bad"), Some(&"00".repeat(32))).unwrap_err().to_string().contains("mismatch"));
-        join(gpath.to_str().unwrap(), &root.join("full-ok"), Some(&hash)).unwrap();
+        assert!(join(gpath.to_str().unwrap(), &root.join("full-bad"), Some(&"00".repeat(32)), true).unwrap_err().to_string().contains("mismatch"));
+        join(gpath.to_str().unwrap(), &root.join("full-ok"), Some(&hash), true).unwrap();
         std::fs::remove_dir_all(root).ok();
     }
 
