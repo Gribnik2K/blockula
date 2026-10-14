@@ -1,11 +1,20 @@
 // Canonical transaction encoding. Must stay byte-identical to node/src/types.rs `Tx::signing_bytes`.
 
+export type KeyRole =
+  | { type: "owner" }
+  /** Transfers only, at most `limit` drops (amount + fee) per `period_blocks`, until block `expires_at`. */
+  | { type: "session"; limit: string; period_blocks: number; expires_at: number };
+
 export type Action =
   | { type: "transfer"; to: string; amount: string }
-  | { type: "register_name"; name: string };
+  | { type: "register_name"; name: string }
+  | { type: "add_key"; key_id: string; label: string; role: KeyRole }
+  | { type: "remove_key"; key_id: string };
 
 export interface UnsignedTx {
   chain_id: string;
+  /** The account acting; the signing key must be authorized on it. */
+  from: string;
   nonce: number;
   fee: string;
   action: Action;
@@ -35,17 +44,27 @@ class Writer {
 
 export function signingBytes(tx: UnsignedTx): Uint8Array {
   const w = new Writer();
-  w.bytes(utf8.encode("BLOCKULA_TX_V1"));
+  w.bytes(utf8.encode("BLOCKULA_TX_V2"));
   w.str(tx.chain_id);
+  w.str(tx.from);
   w.u64(BigInt(tx.nonce));
   w.u64(BigInt(tx.fee));
-  if (tx.action.type === "transfer") {
-    w.u8(0);
-    w.str(tx.action.to);
-    w.u64(BigInt(tx.action.amount));
-  } else {
-    w.u8(1);
-    w.str(tx.action.name);
+  const a = tx.action;
+  switch (a.type) {
+    case "transfer":
+      w.u8(0); w.str(a.to); w.u64(BigInt(a.amount));
+      break;
+    case "register_name":
+      w.u8(1); w.str(a.name);
+      break;
+    case "add_key":
+      w.u8(2); w.str(a.key_id); w.str(a.label);
+      if (a.role.type === "owner") w.u8(0);
+      else { w.u8(1); w.u64(BigInt(a.role.limit)); w.u64(BigInt(a.role.period_blocks)); w.u64(BigInt(a.role.expires_at)); }
+      break;
+    case "remove_key":
+      w.u8(3); w.str(a.key_id);
+      break;
   }
   w.str(tx.memo);
   return w.done();

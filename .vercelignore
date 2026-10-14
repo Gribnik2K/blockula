@@ -1,0 +1,5 @@
+node
+.scratch-home
+**/node_modules
+**/.next
+**/dist

@@ -1,16 +1,43 @@
 {
   "name": "@blockula/mcp",
   "version": "0.1.0",
-  "description": "🧛 MCP server for Blockula — lets any coding agent run a node, hold a post-quantum wallet, send FANG and claim .boo names",
+  "description": "\ud83e\udddb MCP server for Blockula \u2014 lets any coding agent run a node, hold a post-quantum wallet, send FANG and claim .boo names",
   "type": "module",
-  "bin": { "blockula-mcp": "dist/index.js" },
-  "files": ["dist"],
-  "scripts": { "build": "tsc", "start": "node dist/index.js" },
+  "bin": {
+    "blockula-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
   "license": "MIT",
   "dependencies": {
-    "@blockula/sdk": "0.1.0",
+    "@blockula/sdk": "^0.1.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "zod": "^4.0.0"
   },
-  "devDependencies": { "@types/node": "*", "typescript": "*" }
+  "devDependencies": {
+    "@types/node": "*",
+    "typescript": "*"
+  },
+  "author": "Jack Dishman",
+  "keywords": [
+    "blockula",
+    "mcp",
+    "model-context-protocol",
+    "post-quantum",
+    "blockchain",
+    "agents"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
 }

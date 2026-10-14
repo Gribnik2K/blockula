@@ -58,7 +58,8 @@ const GLOSSARY = {
   address: "Your account ID: bech32m('boo', BLAKE3(public key)). You rarely need to see it — names like jack.boo point to it.",
   name: "A human-readable .boo name that points to an address, like a domain name for your wallet.",
   finalized: "Included in a block. On Blockula, once a block is sealed it's final — no waiting for confirmations.",
-  proposer: "The validator that assembled and signed this block.",
+  proposer: "The validator that proposed this block. A 2/3+ quorum of validators then voted (ML-DSA-65 signatures) to finalize it.",
+  certificate: "The finality proof: ML-DSA-65 votes from a 2/3+ quorum of validators. Blocks finalized as an ancestor of a later block share that later block's certificate.",
   burned: "Fees destroyed forever. Burning offsets new issuance and ties the token's value to real network usage.",
 };
 const term = (key, text) => `<span class="term" data-tip="${esc(GLOSSARY[key])}">${esc(text ?? key)}</span>`;
@@ -94,7 +95,7 @@ const views = {
         <dt>${term("hash", "block hash")}</dt><dd class="mono">${esc(b.hash)}</dd>
         <dt>${term("hash", "previous hash")}</dt><dd class="mono">${esc(b.prev_hash)}</dd>
         <dt>${term("state_root")}</dt><dd class="mono">${esc(b.state_root)}</dd>
-        <dt>${term("signature")}</dt><dd>ML-DSA-65 · ${b.signature_bytes.toLocaleString()} bytes</dd>
+        <dt>${term("certificate", "finality certificate")}</dt><dd>${b.signature_bytes ? `ML-DSA-65 quorum · ${b.signature_bytes.toLocaleString()} bytes` : "finalized via a later block's certificate"}</dd>
       </dl></div><br>
       <div class="card"><h2>Transactions (${b.tx_count})</h2>${b.txs.length ? b.txs.map(txRow).join("") : '<div class="dim">A quiet block. Nothing stirred. 🕸️</div>'}</div>`;
   },

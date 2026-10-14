@@ -2,3 +2,5 @@ node_modules
 dist
 target
 .scratch-home
+.vercel
+.env*

@@ -13,8 +13,16 @@ function rpId() {
   return location.hostname;
 }
 
+type PrfResults = { prf?: { enabled?: boolean; results?: { first?: ArrayBuffer } } };
+
+function walletFrom(cred: PublicKeyCredential | null, prf: Uint8Array, client?: Client) {
+  const wallet = Wallet.fromPasskeyPrf(prf, client);
+  if (cred) wallet.credentialId = new Uint8Array(cred.rawId);
+  return wallet;
+}
+
 async function prfFromCredential(cred: PublicKeyCredential | null): Promise<Uint8Array> {
-  const ext = cred?.getClientExtensionResults() as { prf?: { results?: { first?: ArrayBuffer } } } | undefined;
+  const ext = cred?.getClientExtensionResults() as PrfResults | undefined;
   const first = ext?.prf?.results?.first;
   if (!first) {
     throw new Error("This passkey provider doesn't support the PRF extension. Try iCloud Keychain, Google Password Manager or 1Password.");
@@ -35,12 +43,12 @@ export async function createPasskeyWallet(opts: { username: string; client?: Cli
     },
   })) as PublicKeyCredential | null;
 
-  // Some authenticators only return PRF output on get(), not create().
-  try {
-    return Wallet.fromPasskeyPrf(await prfFromCredential(cred), opts.client);
-  } catch {
-    return unlockPasskeyWallet({ client: opts.client, credentialId: cred ? new Uint8Array(cred.rawId) : undefined });
-  }
+  // Some authenticators only return PRF output on get(), not create(). Only retry with get()
+  // when the authenticator said PRF is enabled, so PRF-less providers fail fast with one prompt.
+  const ext = cred?.getClientExtensionResults() as PrfResults | undefined;
+  if (ext?.prf?.results?.first) return walletFrom(cred, new Uint8Array(ext.prf.results.first), opts.client);
+  if (ext?.prf?.enabled) return unlockPasskeyWallet({ client: opts.client, credentialId: cred ? new Uint8Array(cred.rawId) : undefined });
+  return walletFrom(cred, await prfFromCredential(cred), opts.client);
 }
 
 /** Unlock an existing passkey wallet (shows the OS passkey picker). */
@@ -54,5 +62,5 @@ export async function unlockPasskeyWallet(opts: { client?: Client; credentialId?
       extensions: { prf: { eval: { first: PRF_SALT } } } as AuthenticationExtensionsClientInputs,
     },
   })) as PublicKeyCredential | null;
-  return Wallet.fromPasskeyPrf(await prfFromCredential(cred), opts.client);
+  return walletFrom(cred, await prfFromCredential(cred), opts.client);
 }

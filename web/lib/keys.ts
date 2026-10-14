@@ -1,0 +1,46 @@
+"use client";
+
+import { Client, Wallet } from "@blockula/sdk";
+import { createPasskeyWallet, unlockPasskeyWallet } from "@blockula/sdk/passkey";
+import { b64url, fromB64url, type Hint } from "./session";
+import type { AccountView, KeyAccounts } from "./types";
+
+export async function createPasskey(client: Client, username: string) {
+  const wallet = await createPasskeyWallet({ username, client, rpName: "Blockula Wallet" });
+  const credentialId = wallet.credentialId ? b64url(wallet.credentialId) : undefined;
+  return { wallet, hint: { v: 1, kind: "passkey", credentialId, keyId: wallet.keyId } satisfies Hint };
+}
+
+export async function unlockPasskey(client: Client, credentialId?: string) {
+  const wallet = await unlockPasskeyWallet({ client, credentialId: credentialId ? fromB64url(credentialId) : undefined });
+  return { wallet, credentialId: wallet.credentialId ? b64url(wallet.credentialId) : credentialId };
+}
+
+export function createLocalKey(client: Client) {
+  const wallet = Wallet.generate(client);
+  return { wallet, hint: { v: 1, kind: "local", keyId: wallet.keyId, seed: wallet.seedHex } satisfies Hint };
+}
+
+export type AccountChoice = { address: string; name: string | null; short: string; role: string; label: string; balance: string };
+
+/**
+ * Accounts this key may act for. The node always lists the key's own address (implicitly
+ * authorized) even if it was never used, so hide it when it's empty and there's somewhere better.
+ */
+export async function findAccounts(client: Client, wallet: Wallet): Promise<AccountChoice[]> {
+  const res = (await client.keyAccounts(wallet.keyId)) as KeyAccounts;
+  const out: AccountChoice[] = [];
+  // Node quirk: once an account has added any key, /api/key lists the key's own account twice.
+  const seen = new Set<string>();
+  for (const a of res.accounts) {
+    if (seen.has(a.account.address)) continue;
+    seen.add(a.account.address);
+    const acct = (await client.account(a.account.address).catch(() => null)) as AccountView | null;
+    out.push({ address: a.account.address, name: acct?.names[0] ?? a.account.name, short: a.account.short, role: a.role.type, label: a.label, balance: acct?.balance_display ?? "0 FANG" });
+  }
+  const others = out.filter((a) => a.address !== wallet.address);
+  const own = out.find((a) => a.address === wallet.address);
+  const ownUsed = own && (own.balance !== "0 FANG" || own.name);
+  if (others.length && !ownUsed) return others;
+  return out;
+}

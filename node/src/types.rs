@@ -217,20 +217,6 @@ pub struct Block {
     pub signature: String,
 }
 
-impl Block {
-    pub fn header_bytes(&self) -> Vec<u8> {
-        let mut out = b"BLOCKULA_BLOCK_V1".to_vec();
-        out.extend_from_slice(&self.height.to_le_bytes());
-        put_str(&mut out, &self.prev_hash);
-        out.extend_from_slice(&self.timestamp_ms.to_le_bytes());
-        put_str(&mut out, &self.proposer);
-        put_str(&mut out, &self.state_root);
-        let ids: Vec<String> = self.txs.iter().map(|t| t.id()).collect();
-        put_str(&mut out, &hex::encode(crypto::hash(ids.join(",").as_bytes())));
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

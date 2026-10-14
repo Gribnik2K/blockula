@@ -43,21 +43,40 @@ const wallet = await createPasskeyWallet({ username: "vlad" });
 claude mcp add blockula -- npx -y @blockula/mcp
 ```
 
-Then paste the prompt from [AGENTS.md](AGENTS.md). MCP tools: `start_dev_node`, `summon_chain`, `create_wallet`, `wallet_info`, `faucet`, `send`, `check_name`, `register_name`, `lookup`, `latest_blocks`, `status`.
+Then paste the prompt from [AGENTS.md](AGENTS.md). MCP tools: `start_dev_node`, `summon_chain`, `create_wallet`, `use_account`, `wallet_info`, `faucet`, `send`, `check_name`, `register_name`, `lookup`, `latest_blocks`, `status`.
 
 ## Run your own chain
 
-`summon` creates a new genesis and validator key in `~/.blockula/mychain`; `run` starts it.
+`summon` creates a genesis plus validator keys; `run` starts a validator. Consensus is
+[Commonware](https://commonware.xyz) **simplex BFT** with ML-DSA-65 votes and certificates, so the
+same binary runs a 1-validator chain or a multi-validator network.
 
 ```bash
+# one validator (HTTP on 7070)
 blockula summon mychain
-blockula run --home ~/.blockula/mychain --port 7070
+blockula run --home ~/.blockula/mychain
+
+# a local 4-validator testnet: ~/.blockula/mynet/v0 … v3, ports picked automatically
+blockula summon mynet --validators 4
+blockula run --home ~/.blockula/mynet/v0     # repeat for v1, v2, v3 (each prints its URL)
+
+# a full node: syncs finalized blocks from the validators, serves the API + explorer right away
+blockula join --genesis http://127.0.0.1:<v0 http port> --home ~/.blockula/mynet-full --port 7171
 ```
+
+Any node accepts txs (they're gossiped to the leader) and, on chains with a faucet, faucet
+requests (each validator's own genesis-funded account pays; full nodes forward). Nodes restart
+where they left off; a validator that was down catches up via block backfill.
+`scripts/local-testnet.sh` runs 4 validators + a full node and the SDK e2e against them.
+
+**Testnet only.** The p2p transport authenticates peers with ML-DSA-65 but encrypts with
+X25519 + ChaCha20-Poly1305, which is not post-quantum (see [docs/PLAN.md](docs/PLAN.md#known-limits)).
 
 ## Layout
 
 ```
-node/     Rust node: chain, ML-DSA crypto, HTTP API, built-in explorer (src/explorer.html)
+node/     Rust node: consensus (Commonware simplex + marshal), chain execution, ML-DSA crypto, HTTP API, explorer
+scripts/  local-testnet.sh: 4 validators + full node smoke test
 sdk-ts/   @blockula/sdk: wallets, tx signing, client, passkey (WebAuthn PRF) helpers
 mcp/      @blockula/mcp: MCP server for coding agents
 docs/     PLAN.md: architecture, tokenomics, roadmap
@@ -65,4 +84,4 @@ docs/     PLAN.md: architecture, tokenomics, roadmap
 
 ## Status
 
-Phase 0: a single-validator dev chain. **Not audited. Don't put real value on it.** See [docs/PLAN.md](docs/PLAN.md).
+Phase 1 in progress: multi-validator BFT, p2p and `join` work on local testnets. **Not audited. Don't put real value on it.** See [docs/PLAN.md](docs/PLAN.md).

@@ -1,0 +1,131 @@
+"use client";
+
+import { Wallet } from "@blockula/sdk";
+import { useRouter } from "next/navigation";
+import { useEffect, useState, type ReactNode } from "react";
+import { friendly, isPrfUnsupported } from "@/lib/errors";
+import { findAccounts, unlockPasskey, type AccountChoice } from "@/lib/keys";
+import type { Hint } from "@/lib/session";
+import { useWallet } from "@/lib/wallet";
+import { AccountPicker } from "./AccountPicker";
+import { ErrorNote, Spinner } from "./ui";
+
+export function Splash({ text = "Rising from the grave…" }: { text?: string }) {
+  return (
+    <div className="splash">
+      <div className="bat">🦇</div>
+      <p className="dim">{text}</p>
+    </div>
+  );
+}
+
+/** Renders children only when a wallet is unlocked; otherwise unlock or onboard. */
+export function RequireWallet({ children }: { children: ReactNode }) {
+  const { ready, hint, wallet } = useWallet();
+  const router = useRouter();
+  useEffect(() => {
+    if (!ready) return;
+    if (!hint) router.replace("/welcome");
+    else if (wallet && !hint.account) router.replace("/link");
+  }, [ready, hint, wallet, router]);
+  if (!ready || !hint) return <Splash />;
+  if (!wallet) return <Unlock />;
+  if (!hint.account) return <Splash />;
+  return <>{children}</>;
+}
+
+/** Shared "a key is unlocked; now which account does it act for?" step. */
+export function useAccountResolution() {
+  const { client, unlocked } = useWallet();
+  const router = useRouter();
+  const [choices, setChoices] = useState<{ wallet: Wallet; hint: Hint; list: AccountChoice[] } | null>(null);
+
+  const finish = async (w: Wallet, h: Hint, c: AccountChoice) => {
+    await w.actAs(c.address);
+    unlocked(w, { ...h, account: c.address, name: c.name ?? undefined });
+    router.replace("/");
+  };
+
+  const resolve = async (w: Wallet, h: Hint, opts: { waitingForLink?: boolean } = {}) => {
+    const list = await findAccounts(client, w);
+    if (opts.waitingForLink && list.every((c) => c.address === w.address)) {
+      unlocked(w, { ...h, account: undefined });
+      router.replace("/link");
+      return;
+    }
+    if (list.length === 1) return finish(w, h, list[0]);
+    setChoices({ wallet: w, hint: h, list });
+  };
+
+  const picker = choices ? <AccountPicker choices={choices.list} onPick={(c) => finish(choices.wallet, choices.hint, c)} /> : null;
+  return { resolve, picker };
+}
+
+export function Unlock() {
+  const { client, hint, unlocked, forget } = useWallet();
+  const h = hint as Hint;
+  const router = useRouter();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const { resolve, picker } = useAccountResolution();
+
+  const go = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      if (h.kind === "local") {
+        const w = Wallet.fromSeed(h.seed as string, client);
+        if (h.account) {
+          await w.actAs(h.account);
+          unlocked(w, h);
+        } else await resolve(w, h, { waitingForLink: true });
+        return;
+      }
+      const { wallet: w, credentialId } = await unlockPasskey(client, h.credentialId);
+      const next: Hint = { ...h, credentialId };
+      if (w.keyId === h.keyId && h.account) {
+        await w.actAs(h.account);
+        unlocked(w, next);
+      } else {
+        // A different passkey than last time (or a device still waiting to be linked).
+        await resolve(w, { v: 1, kind: "passkey", credentialId, keyId: w.keyId }, { waitingForLink: w.keyId === h.keyId });
+      }
+    } catch (e) {
+      setError(isPrfUnsupported(e) ? `${friendly(e)} Start over to use a browser-only key instead.` : friendly(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Browser-only keys have no prompt to wait for.
+  useEffect(() => {
+    if (h.kind === "local") go();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  if (picker) return <main className="narrow">{picker}</main>;
+
+  return (
+    <main className="narrow center">
+      <div className="hero-emoji">🔒</div>
+      <h1>Welcome back{h.name ? `, ${h.name}` : ""}</h1>
+      <p className="dim">
+        Your wallet stays locked when you're away. We never store your key, so your passkey re-derives it each visit.
+      </p>
+      <button className="btn primary big" disabled={busy} onClick={go}>
+        {busy ? <Spinner>Waiting for your passkey…</Spinner> : h.kind === "local" ? "Unlock browser-only key" : "🔑 Unlock with passkey"}
+      </button>
+      <ErrorNote error={error} />
+      <button
+        className="link"
+        onClick={() => {
+          if (h.kind === "local" && !confirm("This browser-only key lives only here. Forgetting it means losing anything on it unless another device is linked. Continue?")) return;
+          forget();
+          router.replace("/welcome");
+        }}
+      >
+        Use a different wallet
+      </button>
+    </main>
+  );
+}

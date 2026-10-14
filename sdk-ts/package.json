@@ -1,12 +1,19 @@
 {
   "name": "@blockula/sdk",
   "version": "0.1.0",
-  "description": "🧛 TypeScript SDK for Blockula — post-quantum wallets (ML-DSA-65), .boo names, transfers",
+  "description": "\ud83e\udddb TypeScript SDK for Blockula \u2014 post-quantum wallets (ML-DSA-65), .boo names, transfers",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "exports": { ".": "./dist/index.js", "./passkey": "./dist/passkey.js" },
-  "files": ["dist"],
+  "exports": {
+    ".": "./dist/index.js",
+    "./passkey": "./dist/passkey.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "test": "tsx test/e2e.ts"
@@ -21,5 +28,21 @@
     "@types/node": "*",
     "tsx": "*",
     "typescript": "*"
+  },
+  "author": "Jack Dishman",
+  "keywords": [
+    "blockula",
+    "post-quantum",
+    "ml-dsa",
+    "passkey",
+    "webauthn",
+    "blockchain",
+    "wallet"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

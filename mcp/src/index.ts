@@ -28,9 +28,18 @@ const server = new McpServer({ name: "blockula", version: "0.1.0" });
 
 const text = (v: unknown) => ({ content: [{ type: "text" as const, text: typeof v === "string" ? v : JSON.stringify(v, null, 2) }] });
 
+interface WalletFile { address: string; key_id: string; seed: string; account?: string }
+
+function readWalletFile(): WalletFile | null {
+  return existsSync(WALLET_FILE) ? JSON.parse(readFileSync(WALLET_FILE, "utf8")) : null;
+}
+
 function loadWallet(): Wallet | null {
-  if (!existsSync(WALLET_FILE)) return null;
-  return Wallet.fromSeed(JSON.parse(readFileSync(WALLET_FILE, "utf8")).seed, client);
+  const f = readWalletFile();
+  if (!f) return null;
+  const w = Wallet.fromSeed(f.seed, client);
+  if (f.account) w.account = f.account;
+  return w;
 }
 
 function requireWallet(): Wallet {
@@ -83,19 +92,46 @@ tool("create_wallet", "Create this agent's post-quantum (ML-DSA-65) wallet, stor
   if (!w) {
     w = Wallet.generate(client);
     mkdirSync(HOME, { recursive: true });
-    writeFileSync(WALLET_FILE, JSON.stringify({ address: w.address, seed: w.seedHex }, null, 2), { mode: 0o600 });
+    writeFileSync(WALLET_FILE, JSON.stringify({ address: w.address, key_id: w.keyId, seed: w.seedHex }, null, 2), { mode: 0o600 });
   }
-  return { address: w.address, existed, stored_at: WALLET_FILE, note: "The seed never leaves this machine. Use faucet to get test FANG." };
+  return {
+    key_id: w.keyId,
+    own_address: w.address,
+    acting_for: w.account,
+    existed,
+    stored_at: WALLET_FILE,
+    next_steps: "To spend from the user's account: ask them to open the Blockula web wallet → Devices & agents → 'Give an agent a budget' and paste this key_id. Then call use_account with their .boo name. (Or use faucet to fund this key's own address for testing.)",
+  };
+});
+
+tool("use_account", "Act for a user's account (name or address) that has authorized this agent's key — usually as a session key with a spending limit. Pass 'self' to go back to the key's own address.", { account: z.string() }, async ({ account }) => {
+  const f = readWalletFile();
+  if (!f) throw new Error("No agent wallet yet — call create_wallet first.");
+  const w = loadWallet()!;
+  if (account === "self") {
+    delete f.account;
+  } else {
+    const addr = await client.resolve(account);
+    const { accounts } = await client.keyAccounts(w.keyId);
+    const grant = accounts.find((a: { account: { address: string } }) => a.account.address === addr);
+    if (!grant) throw new Error(`${account} hasn't authorized this key yet. Ask the user to add key_id ${w.keyId} in their wallet (Devices & agents).`);
+    f.account = addr;
+    writeFileSync(WALLET_FILE, JSON.stringify(f, null, 2), { mode: 0o600 });
+    return { acting_for: grant.account.name ?? addr, role: grant.role, label: grant.label };
+  }
+  writeFileSync(WALLET_FILE, JSON.stringify(f, null, 2), { mode: 0o600 });
+  return { acting_for: w.address };
 });
 
 tool("wallet_info", "This agent's address, balance, .boo names and recent activity.", {}, async () => {
   const w = requireWallet();
-  const a = await client.account(w.address).catch(() => null);
-  return { address: w.address, balance: a?.balance_display ?? "0 FANG", names: a?.names ?? [], recent: (a?.recent_txs ?? []).slice(0, 10).map((t: { summary: string; id: string }) => `${t.summary} (${t.id.slice(0, 12)}…)`) };
+  const a = await client.account(w.account).catch(() => null);
+  const mine = a?.keys?.find((k: { key_id: string }) => k.key_id === w.keyId);
+  return { key_id: w.keyId, acting_for: a?.account?.name ?? w.account, my_permissions: mine ?? "not authorized on this account", address: w.account, balance: a?.balance_display ?? "0 FANG", names: a?.names ?? [], recent: (a?.recent_txs ?? []).slice(0, 10).map((t: { summary: string; id: string }) => `${t.summary} (${t.id.slice(0, 12)}…)`) };
 });
 
 tool("faucet", "Get 100 test FANG on a dev/test chain (to this agent's wallet, or any name/address).", { to: z.string().optional() }, async ({ to }) => {
-  const target = to ?? requireWallet().address;
+  const target = to ?? requireWallet().account;
   const tx = await client.faucet(target);
   return tx.summary;
 });

@@ -1,5 +1,5 @@
-//! Single-proposer chain for Phase 0 (`blockula dev` / `blockula summon`).
-//! Consensus is deliberately simple here; multi-validator BFT comes in Phase 1.
+//! Chain state and execution. Consensus (`consensus.rs`) orders blocks; this module executes
+//! finalized blocks deterministically, in order, and keeps the mempool, indexes and `blocks.jsonl`.
 
 use crate::crypto::{self, Keys};
 use crate::types::*;
@@ -26,16 +26,57 @@ pub struct Allocation {
     pub amount: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ValidatorInfo {
+    /// `boo1…` account of the validator (same seed as its consensus key).
+    pub address: String,
+    /// hex ML-DSA-65 public key: consensus votes and p2p identity.
+    pub public_key: String,
+    /// host:port for authenticated p2p.
+    pub p2p_addr: String,
+    /// host:port of the validator's HTTP API (used by `join` and the faucet forwarder).
+    pub http_addr: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Genesis {
     pub chain_id: String,
     pub token: String,
     pub decimals: u32,
     pub block_time_ms: u64,
-    pub validator: String,
+    pub validators: Vec<ValidatorInfo>,
     pub faucet: bool,
     pub created_at_ms: u64,
     pub allocations: Vec<Allocation>,
+}
+
+impl Genesis {
+    pub fn is_validator(&self, addr: &str) -> bool {
+        self.validators.iter().any(|v| v.address == addr)
+    }
+
+    pub fn initial_state(&self) -> State {
+        let mut state = State::default();
+        for a in &self.allocations {
+            state.credit(&a.address, a.amount);
+            state.supply += a.amount;
+        }
+        state
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        let bytes = fs::read(path).with_context(|| format!("missing {} — run `blockula summon` first", path.display()))?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if v.get("validators").is_none() {
+            bail!("{} was created by an older single-validator Blockula; re-summon it (or `blockula dev --reset`)", path.display());
+        }
+        Ok(serde_json::from_value(v)?)
+    }
+}
+
+/// Free localhost port, picked by the OS. Used when summoning local testnets.
+pub fn free_port() -> Result<u16> {
+    Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -252,56 +293,101 @@ pub fn short(addr: &str) -> String {
     if addr.len() > 16 { format!("{}…{}", &addr[..10], &addr[addr.len() - 6..]) } else { addr.to_string() }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    Validator,
+    FullNode,
+}
+
 pub struct Chain {
     pub home: PathBuf,
     pub genesis: Genesis,
-    pub keys: Keys,
+    /// Validator key (also the faucet key on testnets). `None` on full nodes.
+    pub keys: Option<Keys>,
+    pub role: Role,
     pub state: State,
+    pub genesis_root: String,
+    /// Hash of the genesis consensus block (parent of block 1).
+    pub genesis_hash: String,
     pub blocks: Vec<Block>,
     pub tx_index: HashMap<String, (u64, usize)>,
     pub history: HashMap<String, Vec<String>>,
     pub mempool: Vec<Tx>,
+    /// Highest finalized height we know of (may be ahead of `height()` while catching up).
+    pub finalized_tip: u64,
+    /// Outbound mempool gossip (validators) — every accepted tx is pushed here.
+    pub gossip: Option<futures::channel::mpsc::UnboundedSender<Tx>>,
     log: File,
 }
 
+/// A finalized block handed to `Chain::execute`, straight from consensus.
+pub struct Finalized {
+    pub height: u64,
+    pub hash: String,
+    pub parent: String,
+    pub timestamp_ms: u64,
+    pub proposer: String,
+    pub txs: Vec<Tx>,
+    /// hex-encoded finalization certificate, when we saw it.
+    pub certificate: String,
+}
+
 impl Chain {
-    /// Creates a new chain home: genesis.json + validator.key. Used by `dev` and `summon`.
-    pub fn summon(home: &Path, chain_id: &str, faucet: bool, block_time_ms: u64) -> Result<()> {
-        fs::create_dir_all(home)?;
-        let keys = Keys::generate();
-        let genesis = Genesis {
-            chain_id: chain_id.to_string(),
-            token: "FANG".into(),
-            decimals: DECIMALS,
-            block_time_ms,
-            validator: keys.address(),
-            faucet,
-            created_at_ms: now_ms(),
-            allocations: vec![
-                Allocation { address: keys.address(), amount: 1_000_000_000 * DROPS_PER_FANG },
-                Allocation { address: treasury(), amount: 100_000_000 * DROPS_PER_FANG },
-            ],
-        };
-        fs::write(home.join("genesis.json"), serde_json::to_string_pretty(&genesis)?)?;
-        fs::write(home.join("validator.key"), keys.seed_hex())?;
-        Ok(())
+    /// Creates a new chain. With one validator, `home` gets genesis.json + validator.key.
+    /// With N > 1, `home/v0 … home/v{N-1}` each get the shared genesis and their own key,
+    /// with localhost ports picked automatically.
+    pub fn summon(home: &Path, chain_id: &str, faucet: bool, block_time_ms: u64, validators: usize, http_port: Option<u16>) -> Result<Vec<PathBuf>> {
+        if validators == 0 {
+            bail!("need at least one validator");
+        }
+        let keys: Vec<Keys> = (0..validators).map(|_| Keys::generate()).collect();
+        let mut infos = vec![];
+        for (i, k) in keys.iter().enumerate() {
+            let http = match (i, http_port) {
+                (0, Some(p)) => p,
+                _ => free_port()?,
+            };
+            infos.push(ValidatorInfo { address: k.address(), public_key: hex::encode(k.public_key()), p2p_addr: format!("127.0.0.1:{}", free_port()?), http_addr: format!("127.0.0.1:{http}") });
+        }
+        let per_validator = 1_000_000_000 * DROPS_PER_FANG / validators as u64;
+        let mut allocations: Vec<Allocation> = keys.iter().map(|k| Allocation { address: k.address(), amount: per_validator }).collect();
+        allocations.push(Allocation { address: treasury(), amount: 100_000_000 * DROPS_PER_FANG });
+        let genesis = Genesis { chain_id: chain_id.to_string(), token: "FANG".into(), decimals: DECIMALS, block_time_ms, validators: infos, faucet, created_at_ms: now_ms(), allocations };
+        let homes: Vec<PathBuf> = if validators == 1 { vec![home.to_path_buf()] } else { (0..validators).map(|i| home.join(format!("v{i}"))).collect() };
+        for (h, k) in homes.iter().zip(&keys) {
+            fs::create_dir_all(h)?;
+            fs::write(h.join("genesis.json"), serde_json::to_string_pretty(&genesis)?)?;
+            fs::write(h.join("validator.key"), k.seed_hex())?;
+        }
+        if validators > 1 {
+            fs::write(home.join("genesis.json"), serde_json::to_string_pretty(&genesis)?)?;
+        }
+        Ok(homes)
     }
 
+    /// Opens a chain home and replays `blocks.jsonl`, re-executing every block and checking
+    /// state roots and hash links. `validator.key` is optional (full nodes don't have one).
     pub fn open(home: &Path) -> Result<Self> {
-        let genesis: Genesis = serde_json::from_slice(&fs::read(home.join("genesis.json")).context("missing genesis.json — run `blockula summon` first")?)?;
-        let seed = hex::decode(fs::read_to_string(home.join("validator.key"))?.trim())?;
-        let keys = Keys::from_seed(seed.try_into().map_err(|_| anyhow!("validator.key must be 32 bytes hex"))?);
-        if keys.address() != genesis.validator {
-            bail!("validator.key does not match genesis validator");
-        }
-        let mut state = State::default();
-        for a in &genesis.allocations {
-            state.credit(&a.address, a.amount);
-            state.supply += a.amount;
-        }
+        let genesis = Genesis::load(&home.join("genesis.json"))?;
+        let key_path = home.join("validator.key");
+        let keys = if key_path.exists() {
+            let seed = hex::decode(fs::read_to_string(&key_path)?.trim())?;
+            let keys = Keys::from_seed(seed.try_into().map_err(|_| anyhow!("validator.key must be 32 bytes hex"))?);
+            if !genesis.is_validator(&keys.address()) {
+                bail!("validator.key is not in this genesis' validator set");
+            }
+            Some(keys)
+        } else {
+            None
+        };
+        let role = if keys.is_some() { Role::Validator } else { Role::FullNode };
+        let state = genesis.initial_state();
+        let genesis_root = state.root();
+        let genesis_hash = hex::encode(crate::consensus::genesis_block(&genesis).digest_bytes());
         let path = home.join("blocks.jsonl");
         let log = OpenOptions::new().create(true).append(true).open(&path)?;
-        let mut chain = Chain { home: home.into(), genesis, keys, state, blocks: vec![], tx_index: HashMap::new(), history: HashMap::new(), mempool: vec![], log };
+        let mut chain = Chain { home: home.into(), genesis, keys, role, state, genesis_root, genesis_hash, blocks: vec![], tx_index: HashMap::new(), history: HashMap::new(), mempool: vec![], finalized_tip: 0, gossip: None, log };
         for line in BufReader::new(File::open(&path)?).lines() {
             let line = line?;
             if line.trim().is_empty() {
@@ -310,7 +396,25 @@ impl Chain {
             let block: Block = serde_json::from_str(&line)?;
             chain.replay(block)?;
         }
+        chain.finalized_tip = chain.height();
         Ok(chain)
+    }
+
+    /// The validator's own address (fee recipient, faucet account).
+    pub fn me(&self) -> Option<String> {
+        self.keys.as_ref().map(|k| k.address())
+    }
+
+    /// State root after executing `height` (0 = genesis).
+    pub fn root_at(&self, height: u64) -> Option<&str> {
+        if height == 0 {
+            return Some(&self.genesis_root);
+        }
+        self.blocks.get(height as usize - 1).map(|b| b.state_root.as_str())
+    }
+
+    pub fn last_hash(&self) -> &str {
+        self.blocks.last().map(|b| b.hash.as_str()).unwrap_or(&self.genesis_hash)
     }
 
     pub fn height(&self) -> u64 {
@@ -336,10 +440,11 @@ impl Chain {
     }
 
     fn replay(&mut self, block: Block) -> Result<()> {
-        let pk = self.keys.public_key();
-        crypto::verify(&pk, &block.header_bytes(), &hex::decode(&block.signature)?).context("block signature")?;
+        if block.height != self.height() + 1 || block.prev_hash != self.last_hash() {
+            bail!("blocks.jsonl is not contiguous at height {}", block.height);
+        }
         for tx in &block.txs {
-            self.state.apply(tx, &self.genesis.chain_id, &block.proposer, block.height)?;
+            self.state.apply(tx, &self.genesis.chain_id, &block.proposer, block.height).with_context(|| format!("replaying block {}", block.height))?;
         }
         if self.state.root() != block.state_root {
             bail!("state root mismatch at height {}", block.height);
@@ -349,45 +454,79 @@ impl Chain {
         Ok(())
     }
 
-    /// Checks a tx against current state plus whatever is already queued, then queues it.
-    pub fn submit(&mut self, tx: Tx) -> Result<String> {
-        let mut scratch = self.state.clone();
-        let next = self.height() + 1;
-        for queued in &self.mempool {
-            let _ = scratch.apply(queued, &self.genesis.chain_id, &self.genesis.validator, next);
+    /// Executes a finalized block: applies its txs in order, skipping invalid ones (exactly like
+    /// the old single-proposer loop), appends it durably to `blocks.jsonl`, then prunes the mempool.
+    pub fn execute(&mut self, f: Finalized) -> Result<()> {
+        if f.height != self.height() + 1 {
+            bail!("expected block {}, got {}", self.height() + 1, f.height);
         }
-        scratch.apply(&tx, &self.genesis.chain_id, &self.genesis.validator, next)?;
-        let id = tx.id();
-        self.mempool.push(tx);
-        Ok(id)
-    }
-
-    pub fn produce_block(&mut self) -> Result<&Block> {
-        let height = self.height() + 1;
-        let proposer = self.genesis.validator.clone();
+        if f.parent != self.last_hash() {
+            bail!("block {} does not extend our chain", f.height);
+        }
         let mut txs = vec![];
-        for tx in std::mem::take(&mut self.mempool) {
-            if self.state.apply(&tx, &self.genesis.chain_id, &proposer, height).is_ok() {
+        for tx in f.txs {
+            if self.state.apply(&tx, &self.genesis.chain_id, &f.proposer, f.height).is_ok() {
                 txs.push(tx);
             }
         }
-        let mut block = Block {
-            height,
-            prev_hash: self.blocks.last().map(|b| b.hash.clone()).unwrap_or_else(|| "0".repeat(64)),
-            timestamp_ms: now_ms(),
-            proposer,
-            state_root: self.state.root(),
-            txs,
-            hash: String::new(),
-            signature: String::new(),
-        };
-        let header = block.header_bytes();
-        block.hash = hex::encode(crypto::hash(&header));
-        block.signature = hex::encode(self.keys.sign(&header));
+        let block = Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, proposer: f.proposer, state_root: self.state.root(), txs, hash: f.hash, signature: f.certificate };
         writeln!(self.log, "{}", serde_json::to_string(&block)?)?;
+        self.log.sync_data()?;
         self.index(&block);
         self.blocks.push(block);
-        Ok(self.blocks.last().unwrap())
+        self.finalized_tip = self.finalized_tip.max(f.height);
+        self.revalidate_mempool();
+        Ok(())
+    }
+
+    /// Drops mempool txs that were included or can no longer apply (bad nonce, spent balance…).
+    fn revalidate_mempool(&mut self) {
+        let mut scratch = self.state.clone();
+        let next = self.height() + 1;
+        let proposer = self.fee_sink();
+        let chain_id = self.genesis.chain_id.clone();
+        let tx_index = &self.tx_index;
+        self.mempool.retain(|tx| !tx_index.contains_key(&tx.id()) && scratch.apply(tx, &chain_id, &proposer, next).is_ok());
+    }
+
+    fn fee_sink(&self) -> String {
+        self.me().unwrap_or_else(|| self.genesis.validators[0].address.clone())
+    }
+
+    /// Checks a tx against current state plus whatever is already queued, then queues it.
+    /// Returns the id and whether it was new (already-known txs are accepted idempotently).
+    pub fn submit_tx(&mut self, tx: Tx) -> Result<(String, bool)> {
+        let id = tx.id();
+        if self.tx_index.contains_key(&id) || self.mempool.iter().any(|t| t.id() == id) {
+            return Ok((id, false));
+        }
+        let mut scratch = self.state.clone();
+        let next = self.height() + 1;
+        let proposer = self.fee_sink();
+        for queued in &self.mempool {
+            let _ = scratch.apply(queued, &self.genesis.chain_id, &proposer, next);
+        }
+        scratch.apply(&tx, &self.genesis.chain_id, &proposer, next)?;
+        if self.mempool.len() >= MAX_MEMPOOL {
+            bail!("mempool is full, try again in a few seconds");
+        }
+        if let Some(g) = &self.gossip {
+            let _ = g.unbounded_send(tx.clone());
+        }
+        self.mempool.push(tx);
+        Ok((id, true))
+    }
+
+    pub fn submit(&mut self, tx: Tx) -> Result<String> {
+        self.submit_tx(tx).map(|(id, _)| id)
+    }
+
+    /// Adds a tx that another node already accepted (full nodes track what they forwarded).
+    pub fn track_pending(&mut self, tx: Tx) {
+        let id = tx.id();
+        if !self.tx_index.contains_key(&id) && !self.mempool.iter().any(|t| t.id() == id) {
+            self.mempool.push(tx);
+        }
     }
 
     /// Next nonce for an address, counting txs already waiting in the mempool.
@@ -395,26 +534,40 @@ impl Chain {
         self.state.account(addr).nonce + self.mempool.iter().filter(|t| t.sender().ok().as_deref() == Some(addr)).count() as u64
     }
 
-    pub fn faucet(&mut self, to: &str, amount: u64) -> Result<String> {
+    /// Testnet faucet: the validator's own genesis-funded account pays. Full nodes forward the
+    /// request to a validator instead (see api.rs).
+    pub fn faucet(&mut self, to: &str, amount: u64) -> Result<Tx> {
         if !self.genesis.faucet {
             bail!("this chain has no faucet");
         }
+        let keys = self.keys.as_ref().ok_or_else(|| anyhow!("this node has no faucet key"))?;
         let to = self.state.resolve(to)?;
+        let from = keys.address();
         let mut tx = Tx {
             chain_id: self.genesis.chain_id.clone(),
-            from: self.genesis.validator.clone(),
-            nonce: self.next_nonce(&self.genesis.validator),
+            nonce: self.next_nonce(&from),
+            from,
             fee: 0,
             action: Action::Transfer { to, amount },
             memo: "🦇 faucet drip".into(),
-            public_key: hex::encode(self.keys.public_key()),
+            public_key: hex::encode(keys.public_key()),
             signature: "00".repeat(crypto::SIGNATURE_LEN),
         };
         tx.fee = min_fee(tx.size());
-        let tx = tx.sign(&self.keys);
-        self.submit(tx)
+        let tx = tx.sign(keys);
+        self.submit(tx.clone())?;
+        Ok(tx)
+    }
+
+    /// Test helper: execute the mempool as the next block (what a lone validator would finalize).
+    #[cfg(test)]
+    pub fn produce_block(&mut self) -> Result<()> {
+        let f = Finalized { height: self.height() + 1, hash: hex::encode(crypto::hash(format!("test-{}", self.height()).as_bytes())), parent: self.last_hash().to_string(), timestamp_ms: now_ms(), proposer: self.fee_sink(), txs: self.mempool.clone(), certificate: String::new() };
+        self.execute(f)
     }
 }
+
+pub const MAX_MEMPOOL: usize = 5_000;
 
 #[cfg(test)]
 mod tests {
@@ -423,7 +576,7 @@ mod tests {
     #[test]
     fn transfer_and_names_survive_restart() {
         let home = std::env::temp_dir().join(format!("blockula-test-{}", now_ms()));
-        Chain::summon(&home, "test-1", true, 1000).unwrap();
+        Chain::summon(&home, "test-1", true, 1000, 1, None).unwrap();
         let alice = Keys::from_seed([1u8; 32]);
         {
             let mut c = Chain::open(&home).unwrap();
@@ -439,6 +592,56 @@ mod tests {
         let c = Chain::open(&home).unwrap();
         assert_eq!(c.height(), 2);
         assert_eq!(c.state.primary_name(&alice.address()).unwrap(), "alice.boo");
+        fs::remove_dir_all(home).ok();
+    }
+
+    fn signed(c: &Chain, from: &str, keys: &Keys, nonce: u64, action: Action) -> Tx {
+        let mut tx = Tx { chain_id: c.genesis.chain_id.clone(), from: from.into(), nonce, fee: 0, action, memo: String::new(), public_key: hex::encode(keys.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        tx.fee = min_fee(tx.size());
+        tx.sign(keys)
+    }
+
+    #[test]
+    fn owner_and_session_keys() {
+        let home = std::env::temp_dir().join(format!("blockula-aa-{}", now_ms()));
+        Chain::summon(&home, "test-aa", true, 1000, 1, None).unwrap();
+        let mut c = Chain::open(&home).unwrap();
+        let (owner, laptop, agent) = (Keys::from_seed([1u8; 32]), Keys::from_seed([2u8; 32]), Keys::from_seed([3u8; 32]));
+        let acct = owner.address();
+        c.faucet(&acct, 100 * DROPS_PER_FANG).unwrap();
+        c.produce_block().unwrap();
+
+        // A stranger's key can't act for the account.
+        assert!(c.submit(signed(&c, &acct, &agent, 0, Action::Transfer { to: agent.address(), amount: 1 })).unwrap_err().to_string().contains("isn't authorized"));
+
+        // Owner adds a second device and an agent session key: 5 FANG per 10 blocks.
+        let session = KeyRole::Session { limit: 5 * DROPS_PER_FANG, period_blocks: 10, expires_at: 1_000 };
+        c.submit(signed(&c, &acct, &owner, 0, Action::AddKey { key_id: key_id(&laptop.public_key()), label: "laptop".into(), role: KeyRole::Owner })).unwrap();
+        c.submit(signed(&c, &acct, &owner, 1, Action::AddKey { key_id: key_id(&agent.public_key()), label: "claude".into(), role: session })).unwrap();
+        c.produce_block().unwrap();
+        assert_eq!(c.state.keys_of(&acct).len(), 3);
+
+        // The agent can spend within its limit, from the owner's account…
+        c.submit(signed(&c, &acct, &agent, 2, Action::Transfer { to: laptop.address(), amount: 3 * DROPS_PER_FANG })).unwrap();
+        c.produce_block().unwrap();
+        // …but not past it, and never anything other than transfers.
+        let over = c.submit(signed(&c, &acct, &agent, 3, Action::Transfer { to: laptop.address(), amount: 2 * DROPS_PER_FANG }));
+        assert!(over.unwrap_err().to_string().contains("limit reached"));
+        let reg = c.submit(signed(&c, &acct, &agent, 3, Action::RegisterName { name: "sneaky".into() }));
+        assert!(reg.unwrap_err().to_string().contains("only send transfers"));
+
+        // The laptop (owner) revokes the agent; the original key can't be the last owner removed.
+        c.submit(signed(&c, &acct, &laptop, 3, Action::RemoveKey { key_id: key_id(&agent.public_key()) })).unwrap();
+        c.submit(signed(&c, &acct, &laptop, 4, Action::RemoveKey { key_id: key_id(&owner.public_key()) })).unwrap();
+        c.produce_block().unwrap();
+        let last = c.submit(signed(&c, &acct, &laptop, 5, Action::RemoveKey { key_id: key_id(&laptop.public_key()) }));
+        assert!(last.unwrap_err().to_string().contains("last owner"));
+        assert!(c.submit(signed(&c, &acct, &agent, 5, Action::Transfer { to: laptop.address(), amount: 1 })).is_err());
+
+        // Everything replays identically from disk.
+        let root = c.state.root();
+        drop(c);
+        assert_eq!(Chain::open(&home).unwrap().state.root(), root);
         fs::remove_dir_all(home).ok();
     }
 }
