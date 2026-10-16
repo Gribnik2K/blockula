@@ -68,7 +68,7 @@ function Send() {
   const [to, setTo] = useState(params.get("to") ?? "");
   const [amount, setAmount] = useState(params.get("amount") ?? "");
   const [memo, setMemo] = useState(params.get("memo") ?? "");
-  const prefilled = params.has("to") || params.has("amount");
+  const prefilled = params.has("to") || params.has("amount") || params.has("memo");
   const [review, setReview] = useState<{ tx: Tx; display: string } | null>(null);
   const [sent, setSent] = useState<TxView | null>(null);
   const [busy, setBusy] = useState(false);
