@@ -35,3 +35,5 @@ jobs:
       - run: npm ci
       - run: npm run build -w @blockula/sdk && npm run build -w @blockula/mcp && npm run build -w @blockula/web
       - run: npm test -w @blockula/web
+      - name: Explorer backdrop bundle is up to date
+        run: npm run build:haunt && git diff --exit-code node/src/haunt.js

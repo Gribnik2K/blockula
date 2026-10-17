@@ -4,6 +4,7 @@ import { parseFang } from "@blockula/sdk";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { RequireWallet } from "@/components/Gate";
+import { Apparition } from "@/components/Haunt";
 import { QrCode } from "@/components/QrCode";
 import { Copy, ExplorerLink, Tip } from "@/components/ui";
 import { explorer, NETWORK, walletUrl } from "@/lib/config";
@@ -27,6 +28,7 @@ function Receive() {
   return (
     <main className="narrow stack-lg">
       <Link href="/" className="back">← Home</Link>
+      <Apparition kind="cauldron" />
       <h1>Receive FANG</h1>
       <PayRequest to={name ?? addr} />
       {name ? (
