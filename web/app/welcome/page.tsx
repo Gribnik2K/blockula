@@ -4,9 +4,11 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { Splash, useAccountResolution } from "@/components/Gate";
-import { NameClaim } from "@/components/NameClaim";
-import { Ornament, type OrnamentKind } from "@/components/Ornament";
+import { epitaph, NameClaim } from "@/components/NameClaim";
+import { Apparition } from "@/components/Haunt";
 import { ErrorNote, Spinner, Tip } from "@/components/ui";
+import type { PropKind } from "@/lib/ascii/scenes";
+import { season } from "@/lib/ascii/settings";
 import { friendly, isPrfUnsupported } from "@/lib/errors";
 import { createLocalKey, createPasskey, unlockPasskey } from "@/lib/keys";
 import type { Hint } from "@/lib/session";
@@ -14,7 +16,7 @@ import { useWallet } from "@/lib/wallet";
 
 type Step = 0 | 1 | 2 | "start" | "prf" | "fund" | "name" | "done";
 
-const INTRO: { ornament: OrnamentKind; chapter: string; title: string; body: string }[] = [
+const INTRO: { ornament: PropKind; chapter: string; title: string; body: string }[] = [
   {
     ornament: "bat",
     chapter: "Chapter I",
@@ -44,6 +46,7 @@ export default function Welcome() {
   const [error, setError] = useState<string | null>(null);
   const [funded, setFunded] = useState<string | null>(null);
   const [claimed, setClaimed] = useState<string | null>(null);
+  const [typed, setTyped] = useState("");
   const { resolve, picker } = useAccountResolution();
   const inFlow = useRef(false);
 
@@ -117,7 +120,7 @@ export default function Welcome() {
     const s = INTRO[step];
     return (
       <main className="narrow center onboarding">
-        <Ornament kind={s.ornament} className="hero-ornament" />
+        <Apparition kind={s.ornament} />
         <span className="eyebrow">{s.chapter}</span>
         <h1>{s.title}</h1>
         <p className="chapter-body">{s.body}</p>
@@ -164,7 +167,7 @@ export default function Welcome() {
     return (
       <main className="narrow stack-lg">
         <div className="center">
-          <Ornament kind="candle" className="hero-ornament" />
+          <Apparition kind="candle" />
           <h1>Your passkey can&apos;t unlock a wallet (yet)</h1>
         </div>
         <section className="card stack">
@@ -189,7 +192,7 @@ export default function Welcome() {
   if (step === "fund")
     return (
       <main className="narrow center stack-lg">
-        <Ornament kind="bat" className="hero-ornament" />
+        <Apparition kind="bat" />
         <h1>{funded ? `${funded} landed!` : "Fetching some test FANG…"}</h1>
         <p className="lead">
           {funded
@@ -206,6 +209,7 @@ export default function Welcome() {
     return (
       <main className="narrow stack-lg">
         <div className="center">
+          <Apparition kind="grave" text={epitaph(typed)} />
           <span className="eyebrow">Your name</span>
           <h1>Claim your .boo name</h1>
           <p className="dim">
@@ -213,7 +217,7 @@ export default function Welcome() {
           </p>
         </div>
         <section className="card">
-          <NameClaim onClaimed={(n) => { setClaimed(n); setStep("done"); }} />
+          <NameClaim onName={setTyped} onClaimed={(n) => { setClaimed(n); setStep("done"); }} />
         </section>
         <button className="link center-self" onClick={() => setStep("done")}>Skip for now</button>
       </main>
@@ -221,7 +225,8 @@ export default function Welcome() {
 
   return (
     <main className="narrow center stack-lg">
-      <Ornament kind="moon" className="hero-ornament" />
+      {/* Never the first render (so no hydration to match): fine to read the date here. */}
+      <Apparition kind={season() === "halloween" ? "pumpkin" : "moon"} />
       <h1>{claimed ? `Welcome to the night, ${claimed}` : "Your wallet is ready"}</h1>
       <p className="lead">
         You now own a quantum-safe account. Next time, just unlock with your passkey. There&apos;s nothing to back up, but linking a second device is a good idea.
